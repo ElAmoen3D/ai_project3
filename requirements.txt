@@ -1,0 +1,6 @@
+pip install librosa pydub matplotlib Pillow numpy
+
+# macOS
+brew install ffmpeg
+# Ubuntu/Debian
+#sudo apt install ffmpeg
