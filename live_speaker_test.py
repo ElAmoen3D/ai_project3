@@ -9,8 +9,11 @@ Usage examples:
 """
 
 import argparse
+import importlib
 import os
 import sys
+import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -22,7 +25,44 @@ except ImportError:
     print("Install it with: pip install sounddevice")
     sys.exit(1)
 
-import updated_classifier as uc
+def load_classifier_module():
+    """
+    Load classifier module with fallback names so file renames don't break live test.
+    Priority:
+      1) $SPEAKER_CLASSIFIER_MODULE (if set)
+      2) updated_classifier
+      3) manuel_classifier
+      4) manual_classifier
+    """
+    candidates = []
+    env_name = os.environ.get("SPEAKER_CLASSIFIER_MODULE", "").strip()
+    if env_name:
+        candidates.append(env_name)
+    candidates.extend(["updated_classifier", "manuel_classifier", "manual_classifier"])
+
+    seen = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            module = importlib.import_module(name)
+            if name != "updated_classifier":
+                print(f"Using classifier module: {name}")
+            return module
+        except ModuleNotFoundError:
+            continue
+
+    print("ERROR: Could not import classifier module.")
+    print(
+        "Expected one of: updated_classifier.py, manuel_classifier.py, manual_classifier.py "
+        "in this folder."
+    )
+    print("Or set env var SPEAKER_CLASSIFIER_MODULE=<your_module_name>.")
+    sys.exit(1)
+
+
+uc = load_classifier_module()
 
 
 MODEL_PATH = uc.MODEL_PATH
@@ -97,13 +137,14 @@ def record_clip(seconds: int, sample_rate: int) -> np.ndarray:
     return audio.reshape(-1)
 
 
-def prepare_live_clip(raw_audio: np.ndarray, target_samples: int) -> np.ndarray:
+def prepare_live_clip(raw_audio: np.ndarray, target_samples: int,
+                      apply_trim_silence: bool = True) -> np.ndarray:
     """
     Make live audio closer to training clips:
     - trim silence
     - ensure fixed length by crop/tile
     """
-    trimmed = uc.trim_silence(raw_audio)
+    trimmed = uc.trim_silence(raw_audio) if apply_trim_silence else raw_audio
     if len(trimmed) == 0:
         trimmed = raw_audio
     if len(trimmed) == 0:
@@ -124,9 +165,14 @@ def classify_audio(
     norm_mean: np.ndarray,
     norm_std: np.ndarray,
     target_samples: int,
+    apply_trim_silence: bool = True,
 ):
     """Classify one audio array and return (speaker, score, confidence, margin)."""
-    prepared = prepare_live_clip(raw_audio, target_samples)
+    prepared = prepare_live_clip(
+        raw_audio,
+        target_samples,
+        apply_trim_silence=apply_trim_silence,
+    )
     feat = uc.clip_to_spectrogram(prepared).reshape(1, -1)
     feat = uc.apply_normalizer(feat, norm_mean, norm_std)
     score = float(uc.predict(feat, params)[0])
@@ -139,8 +185,13 @@ def classify_audio(
     return speaker, score, confidence, margin
 
 
-def classify_clip(raw_audio: np.ndarray, params: dict, threshold: float,
-                  norm_mean: np.ndarray, norm_std: np.ndarray):
+def classify_clip(
+    raw_audio: np.ndarray,
+    params: dict,
+    threshold: float,
+    norm_mean: np.ndarray,
+    norm_std: np.ndarray,
+):
     """Classify one recorded clip and print prediction."""
     speaker, score, confidence, margin = classify_audio(
         raw_audio,
@@ -149,6 +200,7 @@ def classify_clip(raw_audio: np.ndarray, params: dict, threshold: float,
         norm_mean,
         norm_std,
         int(uc.CLIP_DURATION * uc.SAMPLE_RATE),
+        apply_trim_silence=True,
     )
     print(f"Prediction: {speaker}")
     print(
@@ -168,6 +220,8 @@ def run_live_stream(
     min_margin: float,
     smooth_votes: int,
     print_all: bool,
+    live_trim_silence: bool,
+    input_latency: str,
 ):
     """
     Continuously read microphone audio and classify using a rolling window.
@@ -183,52 +237,116 @@ def run_live_stream(
     if hop_samples > window_samples:
         raise ValueError("hop_seconds must be <= window_seconds")
 
-    buffer = np.zeros(0, dtype=np.float32)
+    # Audio callback writes into this rolling chunk buffer.
+    chunk_buffer = deque()
+    buffered_samples = 0
+    max_buffer_samples = window_samples * 4
+    buffer_lock = threading.Lock()
+
     last_label = None
     overflow_warned = False
+    overflow_events = 0
     vote_buffer = deque(maxlen=max(1, smooth_votes))
 
     print("\nContinuous live classifier ready.")
     print(
         f"Window: {window_seconds}s | Update every: {hop_seconds:.2f}s | "
         f"Min RMS: {min_rms:.4f} | Min margin: {min_margin:.4f} | "
-        f"Smoothing: {max(1, smooth_votes)}"
+        f"Smoothing: {max(1, smooth_votes)} | "
+        f"Live trim silence: {live_trim_silence} | "
+        f"Input latency: {input_latency}"
     )
     print("Press Ctrl+C to stop.\n")
+
+    # Warm up feature extraction/inference once before real-time loop
+    # to avoid one-time startup stalls that can trigger an overflow warning.
+    _ = classify_audio(
+        np.zeros(window_samples, dtype=np.float32),
+        params,
+        threshold,
+        norm_mean,
+        norm_std,
+        window_samples,
+        apply_trim_silence=False,
+    )
+
+    def audio_callback(indata, frames, time_info, status):
+        nonlocal buffered_samples, overflow_events
+        if status.input_overflow:
+            overflow_events += 1
+
+        chunk = indata[:, 0].copy()
+        with buffer_lock:
+            chunk_buffer.append(chunk)
+            buffered_samples += len(chunk)
+            while buffered_samples > max_buffer_samples and chunk_buffer:
+                buffered_samples -= len(chunk_buffer.popleft())
+
+    def get_latest_window():
+        with buffer_lock:
+            if buffered_samples < window_samples:
+                return None
+
+            need = window_samples
+            parts = []
+            for chunk in reversed(chunk_buffer):
+                if need <= 0:
+                    break
+                if len(chunk) <= need:
+                    parts.append(chunk)
+                    need -= len(chunk)
+                else:
+                    parts.append(chunk[-need:])
+                    need = 0
+
+        if need > 0:
+            return None
+        return np.concatenate(parts[::-1], axis=0).astype(np.float32, copy=False)
 
     with sd.InputStream(
         samplerate=sample_rate,
         channels=1,
         dtype="float32",
-        blocksize=hop_samples,
+        blocksize=0,
+        latency=input_latency,
+        callback=audio_callback,
     ) as stream:
+        _ = stream
+        next_update = time.monotonic() + hop_seconds
         while True:
-            frames, overflowed = stream.read(hop_samples)
-            if overflowed and not overflow_warned:
-                print("WARNING: Audio input overflow detected. Predictions may be delayed.")
+            now = time.monotonic()
+            if now < next_update:
+                time.sleep(min(0.02, next_update - now))
+                continue
+            while next_update <= now:
+                next_update += hop_seconds
+
+            if overflow_events > 0 and not overflow_warned:
+                print(
+                    "WARNING: Audio input overflow detected. Predictions may be delayed. "
+                    "Try increasing --hop-seconds (e.g., 2.0+), keep --input-latency high, "
+                    "and close CPU-heavy apps."
+                )
                 overflow_warned = True
 
-            chunk = frames[:, 0]
-            buffer = np.concatenate([buffer, chunk], axis=0)
-
-            if len(buffer) < window_samples:
+            latest_window = get_latest_window()
+            if latest_window is None:
                 continue
-            if len(buffer) > window_samples:
-                buffer = buffer[-window_samples:]
 
-            rms = float(np.sqrt(np.mean(buffer ** 2)))
+            rms = float(np.sqrt(np.mean(latest_window ** 2)))
             if rms < min_rms:
                 if print_all:
                     print("Prediction: (silence/noise) | waiting for clearer speech")
                 continue
 
             speaker, score, confidence, margin = classify_audio(
-                buffer,
+                latest_window,
                 params,
                 threshold,
                 norm_mean,
                 norm_std,
                 window_samples,
+                apply_trim_silence=live_trim_silence,
             )
 
             if margin < min_margin:
@@ -310,6 +428,23 @@ def main():
         action="store_true",
         help="Print every update (default prints only when speaker label changes).",
     )
+    parser.add_argument(
+        "--live-trim-silence",
+        action="store_true",
+        help=(
+            "Apply silence trimming on each live window. This is slower and may cause "
+            "mic overflow on some systems; default is OFF for better realtime stability."
+        ),
+    )
+    parser.add_argument(
+        "--input-latency",
+        choices=["low", "high"],
+        default="high",
+        help=(
+            "Audio input latency hint for sounddevice (default: high). "
+            "Use high to reduce overflow risk; low reduces capture latency."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -335,6 +470,8 @@ def main():
             min_margin=args.min_margin,
             smooth_votes=args.smooth_votes,
             print_all=args.print_all,
+            live_trim_silence=args.live_trim_silence,
+            input_latency=args.input_latency,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
