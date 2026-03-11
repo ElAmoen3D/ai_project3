@@ -49,7 +49,7 @@ N_MELS           = 128
 IMG_SIZE         = 128
 INPUT_SIZE       = IMG_SIZE * IMG_SIZE            # 16384
 
-HIDDEN_SIZE      = 64
+HIDDEN_SIZE      = 5
 OUTPUT_SIZE      = 1
 
 LEARNING_RATE    = 0.01
@@ -143,10 +143,11 @@ def clip_to_spectrogram(y: np.ndarray) -> np.ndarray:
     Compute a log-Mel spectrogram, resize to IMG_SIZE x IMG_SIZE,
     and flatten to a 1D vector of length 16384.
 
-    NOTE: No per-clip normalization is applied here. Global normalization
-    (z-score using training set mean/std) is applied after the full dataset
-    is assembled, so that loudness differences across recordings are preserved
-    as meaningful signal until they are removed consistently across all clips.
+    Per-clip normalization is intentionally NOT applied here.
+    Global z-score normalization (fit on training set, applied to both
+    train and test) is performed after the full dataset is assembled.
+    This preserves cross-recording loudness and noise-floor differences
+    as raw signal, then removes them consistently and without data leakage.
     """
     mel    = librosa.feature.melspectrogram(y=y, sr=SAMPLE_RATE,
                                              n_mels=N_MELS, fmax=8000)
@@ -158,6 +159,7 @@ def clip_to_spectrogram(y: np.ndarray) -> np.ndarray:
         img    = img.resize((IMG_SIZE, IMG_SIZE), PILImage.LANCZOS)
         mel_db = np.array(img)
 
+    # Return raw dB values — no per-clip normalization
     return mel_db.flatten().astype(np.float32)
 
 
@@ -382,7 +384,7 @@ def compute_roc(y_true: np.ndarray, y_scores: np.ndarray) -> tuple:
 
     fprs = np.array(fprs)
     tprs = np.array(tprs)
-    return fprs, tprs, abs(np.trapz(tprs, fprs))
+    return fprs, tprs, abs(np.trapezoid(tprs, fprs))
 
 
 def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:

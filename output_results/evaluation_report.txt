@@ -1,31 +1,19 @@
-VOICE SPEAKER CLASSIFIER - EVALUATION REPORT
+VOICE SPEAKER CLASSIFIER — EVALUATION REPORT
 =======================================================
-Architecture : 16384 -> 16 -> 1
-Epochs       : 100
-Learning rate: 0.01
-Sample rate  : 44100 Hz
-Spectrogram  : 128x128 Mel
+Architecture  : 16384 -> 5 -> 1
+Epochs        : 100
+Learning rate : 0.01
+Sample rate   : 22050 Hz
+Spectrogram   : 128x128 Mel
+Train samples : 823
+Test samples  : 110
 =======================================================
-<<<<<<< HEAD
-Total test samples : 142
-Accuracy           : 98.59%
-AUC                : 0.9991
-Threshold          : 0.5311
+Accuracy      : 90.91%
+AUC           : 0.9868
 -------------------------------------------------------
 Class                 Precision     Recall         F1
-Gabriel (0)              0.9833     0.9833     0.9833
-Raiz (1)                 0.9878     0.9878     0.9878
+Gabriel (0)              0.9787     0.8364     0.9020
+Raiz (1)                 0.8571     0.9818     0.9153
 -------------------------------------------------------
-TP=81  TN=59  FP=1  FN=1
-=======
-Total test samples : 141
-Accuracy           : 85.82%
-AUC                : 1.0000
--------------------------------------------------------
-Class                 Precision     Recall         F1
-Gabriel (0)              1.0000     0.6721     0.8039
-Raiz (1)                 0.8000     1.0000     0.8889
--------------------------------------------------------
-TP=80  TN=41  FP=20  FN=0
->>>>>>> c0fc5b57b841a531754a1947963d6bdbd310000b
+TP=54  TN=46  FP=9  FN=1
 =======================================================
