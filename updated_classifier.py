@@ -67,6 +67,7 @@ RAIZ_LABEL    = 1
 
 OUTPUT_DIR = "output_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(OUTPUT_DIR, "trained_updated_model.npz")
 
 SEED = 42
 np.random.seed(SEED)
@@ -238,6 +239,46 @@ def apply_normalizer(X: np.ndarray, mean: np.ndarray,
     return ((X - mean) / std).astype(np.float32)
 
 
+def save_trained_model(path: str, params: dict, threshold: float,
+                       norm_mean: np.ndarray, norm_std: np.ndarray):
+    """Persist trained weights + threshold + normalizer for live inference."""
+    np.savez(
+        path,
+        W1=params["W1"].astype(np.float32),
+        b1=params["b1"].astype(np.float32),
+        W2=params["W2"].astype(np.float32),
+        b2=params["b2"].astype(np.float32),
+        threshold=np.array(threshold, dtype=np.float32),
+        norm_mean=norm_mean.astype(np.float32),
+        norm_std=norm_std.astype(np.float32),
+        sample_rate=np.array(SAMPLE_RATE, dtype=np.int32),
+        clip_duration=np.array(CLIP_DURATION, dtype=np.int32),
+    )
+    print(f"  Saved trained model: {path}")
+
+
+def load_saved_model(path: str = MODEL_PATH):
+    """Load saved model artifact for inference."""
+    if not os.path.exists(path):
+        return None, None, None, None
+
+    data = np.load(path)
+    required = {"W1", "b1", "W2", "b2", "threshold", "norm_mean", "norm_std"}
+    if not required.issubset(set(data.files)):
+        return None, None, None, None
+
+    params = {
+        "W1": data["W1"].astype(np.float32),
+        "b1": data["b1"].astype(np.float32),
+        "W2": data["W2"].astype(np.float32),
+        "b2": data["b2"].astype(np.float32),
+    }
+    threshold = float(data["threshold"])
+    norm_mean = data["norm_mean"].astype(np.float32)
+    norm_std = data["norm_std"].astype(np.float32)
+    return params, threshold, norm_mean, norm_std
+
+
 # ─────────────────────────────────────────────
 # STEP 5: MANUAL 2-LAYER NEURAL NETWORK (NumPy only)
 # ─────────────────────────────────────────────
@@ -387,6 +428,28 @@ def compute_roc(y_true: np.ndarray, y_scores: np.ndarray) -> tuple:
     return fprs, tprs, abs(np.trapezoid(tprs, fprs))
 
 
+def select_threshold_by_youden(y_true: np.ndarray, y_scores: np.ndarray) -> float:
+    """Select threshold maximizing Youden's J statistic on reference scores."""
+    thresholds = np.linspace(0, 1, 500)
+    pos = np.sum(y_true == 1)
+    neg = np.sum(y_true == 0)
+
+    best_thresh = 0.5
+    best_j = -np.inf
+    for thresh in thresholds:
+        preds = (y_scores >= thresh).astype(int)
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        tpr = tp / pos if pos > 0 else 0.0
+        fpr = fp / neg if neg > 0 else 0.0
+        j = tpr - fpr
+        if j > best_j:
+            best_j = j
+            best_thresh = float(thresh)
+
+    return best_thresh
+
+
 def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
     """Return [[TN, FP], [FN, TP]]."""
     cm = np.zeros((2, 2), dtype=int)
@@ -496,7 +559,7 @@ def plot_attribute_heatmap(params: dict):
 
 def print_and_save_summary(cm: np.ndarray, auc: float,
                            y_true: np.ndarray, y_pred: np.ndarray,
-                           n_train: int):
+                           n_train: int, threshold: float):
     tn, fp, fn, tp = cm[0,0], cm[0,1], cm[1,0], cm[1,1]
     total    = len(y_true)
     accuracy = (tp + tn) / total
@@ -521,6 +584,7 @@ def print_and_save_summary(cm: np.ndarray, auc: float,
         "=" * 55,
         f"Accuracy      : {accuracy*100:.2f}%",
         f"AUC           : {auc:.4f}",
+        f"Threshold     : {threshold:.4f}",
         "-" * 55,
         f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10}",
         f"{'Gabriel (0)':<20} {prec_g:>10.4f} {rec_g:>10.4f} {f1_g:>10.4f}",
@@ -605,8 +669,11 @@ def main():
 
     # ── STEP 6: Evaluate ─────────────────────
     print("\n[STEP 6] Evaluating on test set ...")
+    train_scores = predict(X_train, params)
+    threshold = select_threshold_by_youden(y_train, train_scores)
+    print(f"  Selected threshold from train set (Youden J): {threshold:.4f}")
     y_scores = predict(X_test, params)
-    y_pred   = (y_scores >= 0.5).astype(int)
+    y_pred   = (y_scores >= threshold).astype(int)
 
     fprs, tprs, auc = compute_roc(y_test, y_scores)
     cm              = compute_confusion_matrix(y_test, y_pred)
@@ -621,7 +688,15 @@ def main():
     plot_confusion_matrix(cm, test_accuracy)
     plot_attribute_heatmap(params)
 
-    print_and_save_summary(cm, auc, y_test, y_pred, n_train=len(X_train))
+    print_and_save_summary(
+        cm,
+        auc,
+        y_test,
+        y_pred,
+        n_train=len(X_train),
+        threshold=threshold,
+    )
+    save_trained_model(MODEL_PATH, params, threshold, norm_mean, norm_std)
 
     print(f"\n  All outputs saved to: ./{OUTPUT_DIR}/")
     print("    training_curves.png   — Loss & accuracy over epochs")
@@ -629,6 +704,7 @@ def main():
     print("    confusion_matrix.png  — Labeled confusion matrix")
     print("    attribute_heatmap.png — Input feature importance map")
     print("    evaluation_report.txt — Full classification report")
+    print("    trained_updated_model.npz — Saved model for live inference")
     print("\n  Done.\n")
 
 

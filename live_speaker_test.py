@@ -1,5 +1,5 @@
 """
-Live microphone speaker test for the manual voice classifier.
+Live microphone speaker test for the updated voice classifier.
 
 Usage examples:
   python live_speaker_test.py
@@ -22,72 +22,62 @@ except ImportError:
     print("Install it with: pip install sounddevice")
     sys.exit(1)
 
-import manual_classifier as mc
+import updated_classifier as uc
 
 
-MODEL_PATH = os.path.join(mc.OUTPUT_DIR, "trained_manual_model.npz")
+MODEL_PATH = uc.MODEL_PATH
 
 
 def load_saved_model(path: str):
-    """Load model params and threshold from disk if available."""
-    if not os.path.exists(path):
-        return None, None
+    """Load model params, threshold, and normalizer stats from disk."""
+    return uc.load_saved_model(path)
 
-    data = np.load(path)
-    required = {"W1", "b1", "W2", "b2", "threshold"}
-    if not required.issubset(set(data.files)):
-        return None, None
 
-    params = {
-        "W1": data["W1"].astype(np.float32),
-        "b1": data["b1"].astype(np.float32),
-        "W2": data["W2"].astype(np.float32),
-        "b2": data["b2"].astype(np.float32),
-    }
-    threshold = float(data["threshold"])
-    return params, threshold
+def ensure_training_files_exist():
+    """Ensure the four source files required by updated_classifier are present."""
+    required = [
+        uc.GABRIEL_TRAIN_FILE,
+        uc.RAIZ_TRAIN_FILE,
+        uc.GABRIEL_TEST_FILE,
+        uc.RAIZ_TEST_FILE,
+    ]
+    missing = [fname for fname in required if not os.path.exists(fname)]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Missing required audio file(s) for retraining/testing: {missing_list}"
+        )
 
 
 def train_and_cache_model(path: str):
-    """Train using existing recordings and cache model params + threshold."""
-    print("Training model from recordings...")
+    """
+    Run the full updated_classifier pipeline (train + test + save),
+    then load the saved model artifact for live use.
+    """
+    ensure_training_files_exist()
+    print("Running updated_classifier full pipeline to train/test model...")
+    uc.main()
 
-    y_gabriel = mc.trim_silence(mc.load_and_convert_m4a(mc.GABRIEL_FILE))
-    gabriel_clips = mc.segment_audio(y_gabriel, mc.GABRIEL_LABEL, "Gabriel")
+    params, threshold, norm_mean, norm_std = load_saved_model(path)
+    if params is None:
+        raise RuntimeError(
+            "updated_classifier completed but no valid saved model was found at "
+            f"{path}"
+        )
 
-    y_raiz = mc.trim_silence(mc.load_and_convert_m4a(mc.RAIZ_FILE))
-    raiz_clips = mc.segment_audio(y_raiz, mc.RAIZ_LABEL, "Raiz")
-
-    if len(gabriel_clips) == 0 or len(raiz_clips) == 0:
-        raise RuntimeError("One or both speakers produced 0 clips. Check source audio files.")
-
-    X_train, _, y_train, _ = mc.build_dataset(gabriel_clips, raiz_clips)
-    params, _ = mc.train(X_train, y_train)
-
-    train_scores = mc.predict(X_train, params)
-    threshold = mc.select_threshold_by_youden(y_train, train_scores)
-
-    np.savez(
-        path,
-        W1=params["W1"],
-        b1=params["b1"],
-        W2=params["W2"],
-        b2=params["b2"],
-        threshold=np.array(threshold, dtype=np.float32),
-    )
-    print(f"Saved model cache: {path}")
+    print(f"Loaded freshly trained model: {path}")
     print(f"Using threshold: {threshold:.4f}")
-    return params, threshold
+    return params, threshold, norm_mean, norm_std
 
 
 def get_model(force_retrain: bool):
     """Load cached model if possible; otherwise train and cache."""
     if not force_retrain:
-        params, threshold = load_saved_model(MODEL_PATH)
+        params, threshold, norm_mean, norm_std = load_saved_model(MODEL_PATH)
         if params is not None:
             print(f"Loaded model cache: {MODEL_PATH}")
             print(f"Using threshold: {threshold:.4f}")
-            return params, threshold
+            return params, threshold, norm_mean, norm_std
 
     return train_and_cache_model(MODEL_PATH)
 
@@ -113,7 +103,7 @@ def prepare_live_clip(raw_audio: np.ndarray, target_samples: int) -> np.ndarray:
     - trim silence
     - ensure fixed length by crop/tile
     """
-    trimmed = mc.trim_silence(raw_audio)
+    trimmed = uc.trim_silence(raw_audio)
     if len(trimmed) == 0:
         trimmed = raw_audio
     if len(trimmed) == 0:
@@ -127,11 +117,19 @@ def prepare_live_clip(raw_audio: np.ndarray, target_samples: int) -> np.ndarray:
     return tiled.astype(np.float32)
 
 
-def classify_audio(raw_audio: np.ndarray, params: dict, threshold: float, target_samples: int):
+def classify_audio(
+    raw_audio: np.ndarray,
+    params: dict,
+    threshold: float,
+    norm_mean: np.ndarray,
+    norm_std: np.ndarray,
+    target_samples: int,
+):
     """Classify one audio array and return (speaker, score, confidence, margin)."""
     prepared = prepare_live_clip(raw_audio, target_samples)
-    feat = mc.clip_to_spectrogram(prepared).reshape(1, -1)
-    score = float(mc.predict(feat, params)[0])
+    feat = uc.clip_to_spectrogram(prepared).reshape(1, -1)
+    feat = uc.apply_normalizer(feat, norm_mean, norm_std)
+    score = float(uc.predict(feat, params)[0])
 
     pred = 1 if score >= threshold else 0
     speaker = "Raiz" if pred == 1 else "Gabriel"
@@ -141,13 +139,16 @@ def classify_audio(raw_audio: np.ndarray, params: dict, threshold: float, target
     return speaker, score, confidence, margin
 
 
-def classify_clip(raw_audio: np.ndarray, params: dict, threshold: float):
+def classify_clip(raw_audio: np.ndarray, params: dict, threshold: float,
+                  norm_mean: np.ndarray, norm_std: np.ndarray):
     """Classify one recorded clip and print prediction."""
     speaker, score, confidence, margin = classify_audio(
         raw_audio,
         params,
         threshold,
-        int(mc.CLIP_DURATION * mc.SAMPLE_RATE),
+        norm_mean,
+        norm_std,
+        int(uc.CLIP_DURATION * uc.SAMPLE_RATE),
     )
     print(f"Prediction: {speaker}")
     print(
@@ -159,6 +160,8 @@ def classify_clip(raw_audio: np.ndarray, params: dict, threshold: float):
 def run_live_stream(
     params: dict,
     threshold: float,
+    norm_mean: np.ndarray,
+    norm_std: np.ndarray,
     window_seconds: int,
     hop_seconds: float,
     min_rms: float,
@@ -169,7 +172,7 @@ def run_live_stream(
     """
     Continuously read microphone audio and classify using a rolling window.
     """
-    sample_rate = mc.SAMPLE_RATE
+    sample_rate = uc.SAMPLE_RATE
     window_samples = int(window_seconds * sample_rate)
     hop_samples = int(hop_seconds * sample_rate)
 
@@ -223,6 +226,8 @@ def run_live_stream(
                 buffer,
                 params,
                 threshold,
+                norm_mean,
+                norm_std,
                 window_samples,
             )
 
@@ -267,14 +272,14 @@ def main():
     parser.add_argument(
         "--seconds",
         type=int,
-        default=mc.CLIP_DURATION,
-        help=f"One-shot recording length for --once (default: {mc.CLIP_DURATION}).",
+        default=uc.CLIP_DURATION,
+        help=f"One-shot recording length for --once (default: {uc.CLIP_DURATION}).",
     )
     parser.add_argument(
         "--window-seconds",
         type=int,
-        default=mc.CLIP_DURATION,
-        help=f"Rolling window size for continuous mode (default: {mc.CLIP_DURATION}).",
+        default=uc.CLIP_DURATION,
+        help=f"Rolling window size for continuous mode (default: {uc.CLIP_DURATION}).",
     )
     parser.add_argument(
         "--hop-seconds",
@@ -307,22 +312,23 @@ def main():
     )
     args = parser.parse_args()
 
-    for fname in [mc.GABRIEL_FILE, mc.RAIZ_FILE]:
-        if not os.path.exists(fname):
-            print(f"ERROR: Missing required training file: {fname}")
-            sys.exit(1)
-
-    params, threshold = get_model(force_retrain=args.retrain)
+    try:
+        params, threshold, norm_mean, norm_std = get_model(force_retrain=args.retrain)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
 
     try:
         if args.once:
-            raw_audio = record_clip(args.seconds, mc.SAMPLE_RATE)
-            classify_clip(raw_audio, params, threshold)
+            raw_audio = record_clip(args.seconds, uc.SAMPLE_RATE)
+            classify_clip(raw_audio, params, threshold, norm_mean, norm_std)
             return
 
         run_live_stream(
             params=params,
             threshold=threshold,
+            norm_mean=norm_mean,
+            norm_std=norm_std,
             window_seconds=args.window_seconds,
             hop_seconds=args.hop_seconds,
             min_rms=args.min_rms,
