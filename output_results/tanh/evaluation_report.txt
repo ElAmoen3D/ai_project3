@@ -1,0 +1,20 @@
+VOICE SPEAKER CLASSIFIER — EVALUATION REPORT
+Hidden activation : Tanh
+=======================================================
+Architecture  : 16384 -> 64(Tanh) -> 1(Sigmoid)
+Epochs        : 100
+Learning rate : 0.01
+Sample rate   : 22050 Hz
+Spectrogram   : 128x128 Mel
+Train samples : 823
+Test samples  : 110
+=======================================================
+Accuracy      : 91.82%
+AUC           : 0.9805
+-------------------------------------------------------
+Class                 Precision     Recall         F1
+Gabriel (0)              0.9259     0.9091     0.9174
+Raiz (1)                 0.9107     0.9273     0.9189
+-------------------------------------------------------
+TP=51  TN=50  FP=5  FN=4
+=======================================================

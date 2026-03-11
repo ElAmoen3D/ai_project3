@@ -1,0 +1,20 @@
+VOICE SPEAKER CLASSIFIER — EVALUATION REPORT
+Hidden activation : Sigmoid
+=======================================================
+Architecture  : 16384 -> 64(Sigmoid) -> 1(Sigmoid)
+Epochs        : 100
+Learning rate : 0.01
+Sample rate   : 22050 Hz
+Spectrogram   : 128x128 Mel
+Train samples : 823
+Test samples  : 110
+=======================================================
+Accuracy      : 86.36%
+AUC           : 0.9731
+-------------------------------------------------------
+Class                 Precision     Recall         F1
+Gabriel (0)              0.9348     0.7818     0.8515
+Raiz (1)                 0.8125     0.9455     0.8739
+-------------------------------------------------------
+TP=52  TN=43  FP=12  FN=3
+=======================================================
