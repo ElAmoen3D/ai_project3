@@ -12,6 +12,7 @@ Pipeline:
   4. Build labeled dataset:
        - TRAIN: 100% of gabriel_samples.m4a + raiz_samples.m4a (all available clips)
        - TEST:  gabriel_test.m4a + raiz_test.m4a (balanced — capped to smaller class)
+       - Global normalization: mean & std fitted on training set, applied to both
   5. Train a manual 2-layer neural network (NumPy only, sigmoid activation)
   6. Evaluate: ROC Curve, AUC, Confusion Matrix, Attribute Heatmap
 
@@ -140,7 +141,12 @@ def process_speaker(filepath: str, label: int, speaker_name: str) -> list:
 def clip_to_spectrogram(y: np.ndarray) -> np.ndarray:
     """
     Compute a log-Mel spectrogram, resize to IMG_SIZE x IMG_SIZE,
-    normalize to [0, 1], and flatten to a 1D vector of length 16384.
+    and flatten to a 1D vector of length 16384.
+
+    NOTE: No per-clip normalization is applied here. Global normalization
+    (z-score using training set mean/std) is applied after the full dataset
+    is assembled, so that loudness differences across recordings are preserved
+    as meaningful signal until they are removed consistently across all clips.
     """
     mel    = librosa.feature.melspectrogram(y=y, sr=SAMPLE_RATE,
                                              n_mels=N_MELS, fmax=8000)
@@ -151,12 +157,6 @@ def clip_to_spectrogram(y: np.ndarray) -> np.ndarray:
         img    = PILImage.fromarray(mel_db)
         img    = img.resize((IMG_SIZE, IMG_SIZE), PILImage.LANCZOS)
         mel_db = np.array(img)
-
-    mel_min, mel_max = mel_db.min(), mel_db.max()
-    if mel_max - mel_min > 0:
-        mel_db = (mel_db - mel_min) / (mel_max - mel_min)
-    else:
-        mel_db = mel_db - mel_min
 
     return mel_db.flatten().astype(np.float32)
 
@@ -209,6 +209,31 @@ def build_test_dataset(gabriel_clips: list, raiz_clips: list) -> tuple:
     print(f"  Test set — Gabriel: {int(np.sum(y==0))}, "
           f"Raiz: {int(np.sum(y==1))}, Total: {len(X)}")
     return X, y
+
+
+# ─────────────────────────────────────────────
+# GLOBAL NORMALIZATION
+# ─────────────────────────────────────────────
+
+def fit_normalizer(X_train: np.ndarray) -> tuple:
+    """
+    Compute per-feature mean and std from the training set only.
+    Features with zero std (silent/constant pixels) are given std=1
+    to avoid division by zero — they contribute nothing after centering.
+    """
+    mean = X_train.mean(axis=0)               # (16384,)
+    std  = X_train.std(axis=0)                # (16384,)
+    std  = np.where(std == 0, 1.0, std)       # avoid division by zero
+    print(f"  Normalizer fitted on {len(X_train)} training samples.")
+    print(f"  Feature mean range : [{mean.min():.3f}, {mean.max():.3f}]")
+    print(f"  Feature std  range : [{std.min():.3f},  {std.max():.3f}]")
+    return mean, std
+
+
+def apply_normalizer(X: np.ndarray, mean: np.ndarray,
+                     std: np.ndarray) -> np.ndarray:
+    """Apply z-score normalization: X_norm = (X - mean) / std."""
+    return ((X - mean) / std).astype(np.float32)
 
 
 # ─────────────────────────────────────────────
@@ -562,6 +587,16 @@ def main():
     # ── STEP 3 & 4: Build datasets ────────────
     X_train, y_train = build_train_dataset(gabriel_train, raiz_train)
     X_test,  y_test  = build_test_dataset(gabriel_test,  raiz_test)
+
+    # ── Global normalization ──────────────────
+    # Fit mean/std on training data only, then apply to both sets.
+    # This removes cross-recording loudness/noise-floor differences
+    # without leaking any test set statistics into training.
+    print("\n[NORM] Fitting global normalizer on training set ...")
+    norm_mean, norm_std = fit_normalizer(X_train)
+    X_train = apply_normalizer(X_train, norm_mean, norm_std)
+    X_test  = apply_normalizer(X_test,  norm_mean, norm_std)
+    print("  Normalization applied to train and test sets.")
 
     # ── STEP 5: Train ─────────────────────────
     params, history = train(X_train, y_train)
