@@ -47,7 +47,7 @@ N_MELS            = 128
 IMG_SIZE          = 128
 INPUT_SIZE        = IMG_SIZE * IMG_SIZE
 
-HIDDEN_SIZE       = 64
+HIDDEN_SIZE       = 16
 OUTPUT_SIZE       = 1
 
 LEARNING_RATE     = 0.01
@@ -181,40 +181,45 @@ def clip_to_spectrogram(y: np.ndarray) -> np.ndarray:
 
 def build_dataset(gabriel_clips: list, raiz_clips: list) -> tuple:
     """
-    Convert all clips to feature vectors, combine, shuffle, split 80/20.
+    Convert clips to feature vectors.
+    Split each speaker by time order (first 80% train, last 20% test)
+    to reduce leakage from adjacent clips across train/test.
     Returns X_train, X_test, y_train, y_test as numpy arrays.
     """
     print("\n[STEP 3] Converting clips to Mel spectrograms ...")
+    
+    def clips_to_features(clips: list, speaker_name: str) -> tuple:
+        X_speaker = []
+        y_speaker = []
+        total_speaker = len(clips)
+        for i, (clip, label) in enumerate(clips):
+            if i % 100 == 0:
+                print(f"  Processing {speaker_name} clip {i + 1}/{total_speaker} ...")
+            feat = clip_to_spectrogram(clip)
+            X_speaker.append(feat)
+            y_speaker.append(label)
+        return np.array(X_speaker, dtype=np.float32), np.array(y_speaker, dtype=np.float32)
 
-    all_X = []
-    all_y = []
+    X_g, y_g = clips_to_features(gabriel_clips, "Gabriel")
+    X_r, y_r = clips_to_features(raiz_clips, "Raiz")
 
-    combined = gabriel_clips + raiz_clips
-    total = len(combined)
+    print(f"  Gabriel feature shape: X={X_g.shape}, y={y_g.shape}")
+    print(f"  Raiz feature shape   : X={X_r.shape}, y={y_r.shape}")
 
-    for i, (clip, label) in enumerate(combined):
-        if i % 100 == 0:
-            print(f"  Processing clip {i + 1}/{total} ...")
-        feat = clip_to_spectrogram(clip)
-        all_X.append(feat)
-        all_y.append(label)
+    print("\n[STEP 4] Splitting dataset by time (80% train / 20% test per speaker) ...")
+    split_g = int(len(X_g) * TRAIN_RATIO)
+    split_r = int(len(X_r) * TRAIN_RATIO)
 
-    X = np.array(all_X, dtype=np.float32)
-    y = np.array(all_y, dtype=np.float32)
+    X_train = np.concatenate([X_g[:split_g], X_r[:split_r]], axis=0)
+    y_train = np.concatenate([y_g[:split_g], y_r[:split_r]], axis=0)
+    X_test = np.concatenate([X_g[split_g:], X_r[split_r:]], axis=0)
+    y_test = np.concatenate([y_g[split_g:], y_r[split_r:]], axis=0)
 
-    print(f"  Dataset shape: X={X.shape}, y={y.shape}")
-
-    print("\n[STEP 4] Splitting dataset (80% train / 20% test) ...")
-    indices = np.random.permutation(len(X))
-    split = int(len(X) * TRAIN_RATIO)
-
-    train_idx = indices[:split]
-    test_idx = indices[split:]
-
-    X_train = X[train_idx]
-    y_train = y[train_idx]
-    X_test = X[test_idx]
-    y_test = y[test_idx]
+    # Shuffle within each split so class order does not bias training/evaluation loops.
+    train_perm = np.random.permutation(len(X_train))
+    test_perm = np.random.permutation(len(X_test))
+    X_train, y_train = X_train[train_perm], y_train[train_perm]
+    X_test, y_test = X_test[test_perm], y_test[test_perm]
 
     print(f"  Train samples: {len(X_train)}  |  Test samples: {len(X_test)}")
 
@@ -383,9 +388,38 @@ def compute_roc(y_true: np.ndarray, y_scores: np.ndarray) -> tuple:
     fprs = np.array(fprs, dtype=np.float32)
     tprs = np.array(tprs, dtype=np.float32)
 
+    # Ensure monotonic x-axis for stable trapezoid integration.
+    order = np.argsort(fprs)
+    fprs = fprs[order]
+    tprs = tprs[order]
     auc = np.trapezoid(tprs, fprs)
 
-    return fprs, tprs, abs(float(auc))
+    return fprs, tprs, float(auc)
+
+
+def select_threshold_by_youden(y_true: np.ndarray, y_scores: np.ndarray) -> float:
+    """
+    Select threshold maximizing Youden's J statistic on a reference set.
+    """
+    thresholds = np.linspace(0, 1, 500)
+    pos = np.sum(y_true == 1)
+    neg = np.sum(y_true == 0)
+
+    best_thresh = 0.5
+    best_j = -np.inf
+
+    for thresh in thresholds:
+        preds = (y_scores >= thresh).astype(int)
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        tpr = tp / pos if pos > 0 else 0.0
+        fpr = fp / neg if neg > 0 else 0.0
+        j = tpr - fpr
+        if j > best_j:
+            best_j = j
+            best_thresh = float(thresh)
+
+    return best_thresh
 
 
 def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
@@ -540,7 +574,8 @@ def plot_attribute_heatmap(params: dict):
 
 
 def print_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
-                  y_pred_binary: np.ndarray, y_scores: np.ndarray):
+                  y_pred_binary: np.ndarray, y_scores: np.ndarray,
+                  threshold: float):
     """Print and save full classification report."""
     tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
     total = len(y_true)
@@ -566,6 +601,7 @@ def print_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
     print(f"  Total test samples : {total}")
     print(f"  Accuracy           : {accuracy * 100:.2f}%")
     print(f"  AUC                : {auc:.4f}")
+    print(f"  Threshold          : {threshold:.4f}")
     print("-" * 55)
     print(f"  {'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10}")
     print(f"  {'Gabriel (0)':<20} {precision_gabriel:>10.4f} {recall_gabriel:>10.4f} {f1_gabriel:>10.4f}")
@@ -587,6 +623,7 @@ def print_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
         f.write(f"Total test samples : {total}\n")
         f.write(f"Accuracy           : {accuracy * 100:.2f}%\n")
         f.write(f"AUC                : {auc:.4f}\n")
+        f.write(f"Threshold          : {threshold:.4f}\n")
         f.write("-" * 55 + "\n")
         f.write(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10}\n")
         f.write(f"{'Gabriel (0)':<20} {precision_gabriel:>10.4f} {recall_gabriel:>10.4f} {f1_gabriel:>10.4f}\n")
@@ -641,8 +678,12 @@ def main():
 
     print("\n[STEP 6] Evaluating on test set ...")
 
+    train_scores = predict(X_train, params)
+    threshold = select_threshold_by_youden(y_train, train_scores)
+    print(f"  Selected threshold from train set (Youden J): {threshold:.4f}")
+
     y_scores = predict(X_test, params)
-    y_pred = (y_scores >= 0.5).astype(int)
+    y_pred = (y_scores >= threshold).astype(int)
 
     fprs, tprs, auc = compute_roc(y_test, y_scores)
     cm = compute_confusion_matrix(y_test, y_pred)
@@ -656,7 +697,7 @@ def main():
     plot_confusion_matrix(cm, test_accuracy)
     plot_attribute_heatmap(params)
 
-    print_summary(cm, auc, y_test, y_pred, y_scores)
+    print_summary(cm, auc, y_test, y_pred, y_scores, threshold)
 
     print(f"\n  All outputs saved to: ./{OUTPUT_DIR}/")
     print("  Files:")
