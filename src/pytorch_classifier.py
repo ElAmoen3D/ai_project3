@@ -31,24 +31,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pydub import AudioSegment
-try:
-    from .project_paths import (
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
-except ImportError:
-    from project_paths import (  # type: ignore
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
+from project_paths import (
+    GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
+    RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
+    GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
+    RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
+    RESULTS_DIR,
+    ensure_base_dirs,
+)
 
 try:
     import torch
@@ -81,6 +71,9 @@ LEARNING_RATE = 0.01
 EPOCHS = 100
 BATCH_SIZE = 32
 SILENCE_TOP_DB = 20
+VAL_SPLIT = 0.2
+EARLY_STOP_PATIENCE = 12
+EARLY_STOP_MIN_DELTA = 1e-4
 
 # Audio file paths
 GABRIEL_TRAIN_FILE = PROJECT_GABRIEL_TRAIN_FILE
@@ -238,6 +231,45 @@ def build_test_dataset(gabriel_clips: list, raiz_clips: list) -> tuple:
     return X, y
 
 
+def split_train_validation(X: np.ndarray, y: np.ndarray,
+                           val_split: float = VAL_SPLIT) -> tuple:
+    """Stratified split of training set into train/validation."""
+    if not 0.0 < val_split < 1.0:
+        raise ValueError("val_split must be between 0 and 1.")
+
+    idx0 = np.where(y == GABRIEL_LABEL)[0]
+    idx1 = np.where(y == RAIZ_LABEL)[0]
+    np.random.shuffle(idx0)
+    np.random.shuffle(idx1)
+
+    n0_val = max(1, int(len(idx0) * val_split))
+    n1_val = max(1, int(len(idx1) * val_split))
+    n0_val = min(n0_val, len(idx0) - 1)
+    n1_val = min(n1_val, len(idx1) - 1)
+
+    val_idx = np.concatenate([idx0[:n0_val], idx1[:n1_val]])
+    fit_idx = np.concatenate([idx0[n0_val:], idx1[n1_val:]])
+    np.random.shuffle(val_idx)
+    np.random.shuffle(fit_idx)
+
+    X_fit, y_fit = X[fit_idx], y[fit_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+
+    print(
+        f"  Train/Val split ({int(val_split*100)}%) - "
+        f"Train: {len(X_fit)} | Val: {len(X_val)}"
+    )
+    print(
+        f"    Train classes - Gabriel: {int(np.sum(y_fit==0))}, "
+        f"Raiz: {int(np.sum(y_fit==1))}"
+    )
+    print(
+        f"    Val classes   - Gabriel: {int(np.sum(y_val==0))}, "
+        f"Raiz: {int(np.sum(y_val==1))}"
+    )
+    return X_fit, y_fit, X_val, y_val
+
+
 # ---------------------------------------------------------
 # GLOBAL NORMALIZATION
 # ---------------------------------------------------------
@@ -322,17 +354,23 @@ def predict_proba(model: SpeakerMLP, X: np.ndarray, device: torch.device,
     return np.concatenate(probs, axis=0).astype(np.float32)
 
 
-def train_model(model: SpeakerMLP, X_train: np.ndarray, y_train: np.ndarray,
+def train_model(model: SpeakerMLP,
+                X_fit: np.ndarray, y_fit: np.ndarray,
+                X_val: np.ndarray, y_val: np.ndarray,
                 device: torch.device) -> tuple:
     print("\n[STEP 5] Training PyTorch neural network ...")
     print(f"  Architecture : {INPUT_SIZE} -> {HIDDEN_SIZE} -> {OUTPUT_SIZE}")
     print(f"  Epochs       : {EPOCHS}  |  LR: {LEARNING_RATE}")
     print(f"  Batch size   : {BATCH_SIZE}")
-    print(f"  Train samples: {len(X_train)}")
+    print(f"  Train samples: {len(X_fit)}  |  Val samples: {len(X_val)}")
+    print(
+        f"  Early stop   : patience={EARLY_STOP_PATIENCE}, "
+        f"min_delta={EARLY_STOP_MIN_DELTA}"
+    )
     print(f"  Device       : {device}\n")
 
-    X_tensor = torch.from_numpy(X_train).float()
-    y_tensor = torch.from_numpy(y_train).float()
+    X_tensor = torch.from_numpy(X_fit).float()
+    y_tensor = torch.from_numpy(y_fit).float()
     dataset = TensorDataset(X_tensor, y_tensor)
     loader = DataLoader(
         dataset,
@@ -343,7 +381,11 @@ def train_model(model: SpeakerMLP, X_train: np.ndarray, y_train: np.ndarray,
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
-    history = {"loss": [], "accuracy": []}
+    history = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_val_loss = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -362,22 +404,46 @@ def train_model(model: SpeakerMLP, X_train: np.ndarray, y_train: np.ndarray,
             running_loss += float(loss.item()) * xb.size(0)
 
         epoch_loss = running_loss / len(dataset)
-        train_scores = predict_proba(model, X_train, device, batch_size=1024)
+        train_scores = predict_proba(model, X_fit, device, batch_size=1024)
         preds = (train_scores >= 0.5).astype(np.int32)
-        train_accuracy = float(np.mean(preds == y_train.astype(np.int32)))
+        train_accuracy = float(np.mean(preds == y_fit.astype(np.int32)))
+        val_scores = predict_proba(model, X_val, device, batch_size=1024)
+        val_scores = np.clip(val_scores, 1e-12, 1.0 - 1e-12)
+        val_loss = float(
+            -np.mean(y_val * np.log(val_scores) + (1.0 - y_val) * np.log(1.0 - val_scores))
+        )
+        val_preds = (val_scores >= 0.5).astype(np.int32)
+        val_accuracy = float(np.mean(val_preds == y_val.astype(np.int32)))
 
         history["loss"].append(float(epoch_loss))
         history["accuracy"].append(train_accuracy)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_accuracy)
+
+        if val_loss < (best_val_loss - EARLY_STOP_MIN_DELTA):
+            best_val_loss = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            stale_epochs += 1
 
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"  Epoch {epoch:4d}/{EPOCHS}"
                 f"  |  Loss: {epoch_loss:.6f}"
                 f"  |  Train Accuracy: {train_accuracy * 100:.2f}%"
+                f"  |  Val Loss: {val_loss:.6f}"
+                f"  |  Val Acc: {val_accuracy * 100:.2f}%"
             )
 
-    print("\n  Training complete.")
-    return model, history
+        if stale_epochs >= EARLY_STOP_PATIENCE:
+            print(f"  Early stopping at epoch {epoch} (best epoch: {best_epoch})")
+            break
+
+    model.load_state_dict(best_state)
+    print(f"\n  Training complete. Best epoch: {best_epoch}")
+    return model, history, best_epoch
 
 
 def save_trained_model(path: str, model: SpeakerMLP, threshold: float,
@@ -460,15 +526,19 @@ def plot_training_curves(history: dict):
     epochs = range(1, len(history["loss"]) + 1)
 
     axes[0].plot(epochs, history["loss"], color="#e74c3c", linewidth=2)
-    axes[0].set_title("Training Loss (BCEWithLogits)")
+    axes[0].plot(epochs, history["val_loss"], color="#2c3e50", linewidth=2)
+    axes[0].set_title("Loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
+    axes[0].legend(["Train", "Validation"])
     axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(epochs, [a * 100 for a in history["accuracy"]], color="#2980b9", linewidth=2)
-    axes[1].set_title("Training Accuracy")
+    axes[1].plot(epochs, [a * 100 for a in history["val_accuracy"]], color="#16a085", linewidth=2)
+    axes[1].set_title("Accuracy")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy (%)")
+    axes[1].legend(["Train", "Validation"])
     axes[1].set_ylim([0, 105])
     axes[1].grid(True, alpha=0.3)
 
@@ -570,7 +640,9 @@ def plot_attribute_heatmap(model: SpeakerMLP):
 
 
 def print_and_save_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
-                           y_pred: np.ndarray, n_train: int, threshold: float):
+                           y_pred: np.ndarray, n_train: int, n_val: int,
+                           threshold: float, best_epoch: int,
+                           val_accuracy: float, val_auc: float):
     tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
     total = len(y_true)
     accuracy = (tp + tn) / total if total > 0 else 0.0
@@ -592,14 +664,18 @@ def print_and_save_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
         f"Epochs        : {EPOCHS}",
         f"Learning rate : {LEARNING_RATE}",
         f"Batch size    : {BATCH_SIZE}",
+        f"Best epoch    : {best_epoch}",
         f"Sample rate   : {SAMPLE_RATE} Hz",
         f"Spectrogram   : {IMG_SIZE}x{IMG_SIZE} Mel",
         f"Train samples : {n_train}",
+        f"Val samples   : {n_val}",
         f"Test samples  : {total}",
         "=" * 60,
+        f"Validation Accuracy : {val_accuracy * 100:.2f}%",
+        f"Validation AUC      : {val_auc:.4f}",
+        f"Threshold (Val J)   : {threshold:.4f}",
         f"Accuracy      : {accuracy * 100:.2f}%",
         f"AUC           : {auc:.4f}",
-        f"Threshold     : {threshold:.4f}",
         "-" * 60,
         f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10}",
         f"{'Gabriel (0)':<20} {prec_g:>10.4f} {rec_g:>10.4f} {f1_g:>10.4f}",
@@ -676,23 +752,31 @@ def main():
     X_train, y_train = build_train_dataset(gabriel_train, raiz_train)
     X_test, y_test = build_test_dataset(gabriel_test, raiz_test)
 
-    # Global normalization
-    print("\n[NORM] Fitting global normalizer on training set ...")
-    norm_mean, norm_std = fit_normalizer(X_train)
-    X_train = apply_normalizer(X_train, norm_mean, norm_std)
+    print("\n[VAL] Creating train/validation split from raw training set ...")
+    X_fit, y_fit, X_val, y_val = split_train_validation(X_train, y_train, VAL_SPLIT)
+
+    # Global normalization (fit on train-fit only to avoid validation leakage)
+    print("\n[NORM] Fitting global normalizer on train-fit set only ...")
+    norm_mean, norm_std = fit_normalizer(X_fit)
+    X_fit = apply_normalizer(X_fit, norm_mean, norm_std)
+    X_val = apply_normalizer(X_val, norm_mean, norm_std)
     X_test = apply_normalizer(X_test, norm_mean, norm_std)
-    print("  Normalization applied to train and test sets.")
+    print("  Normalization applied to train-fit, validation, and test sets.")
 
     # Train
     device = get_device()
     model = init_model(device)
-    model, history = train_model(model, X_train, y_train, device)
+    model, history, best_epoch = train_model(model, X_fit, y_fit, X_val, y_val, device)
 
     # Evaluate
     print("\n[STEP 6] Evaluating on test set ...")
-    train_scores = predict_proba(model, X_train, device)
-    threshold = select_threshold_by_youden(y_train, train_scores)
-    print(f"  Selected threshold from train set (Youden J): {threshold:.4f}")
+    val_scores = predict_proba(model, X_val, device)
+    threshold = select_threshold_by_youden(y_val, val_scores)
+    val_pred = (val_scores >= threshold).astype(int)
+    val_accuracy = float(np.mean(val_pred == y_val.astype(int)))
+    _, _, val_auc = compute_roc(y_val, val_scores)
+    print(f"  Selected threshold from validation set (Youden J): {threshold:.4f}")
+    print(f"  Validation Accuracy: {val_accuracy * 100:.2f}%  |  Validation AUC: {val_auc:.4f}")
 
     y_scores = predict_proba(model, X_test, device)
     y_pred = (y_scores >= threshold).astype(int)
@@ -708,7 +792,15 @@ def main():
     plot_roc_curve(fprs, tprs, auc)
     plot_confusion_matrix(cm, test_accuracy)
     plot_attribute_heatmap(model)
-    print_and_save_summary(cm, auc, y_test, y_pred, n_train=len(X_train), threshold=threshold)
+    print_and_save_summary(
+        cm, auc, y_test, y_pred,
+        n_train=len(X_fit),
+        n_val=len(X_val),
+        threshold=threshold,
+        best_epoch=best_epoch,
+        val_accuracy=val_accuracy,
+        val_auc=val_auc,
+    )
     save_trained_model(MODEL_PATH, model, threshold, norm_mean, norm_std)
 
     print(f"\n  All outputs saved to: {OUTPUT_DIR}/")

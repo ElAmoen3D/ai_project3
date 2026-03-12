@@ -45,24 +45,14 @@ from pydub import AudioSegment
 import warnings
 warnings.filterwarnings("ignore")
 
-try:
-    from .project_paths import (
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
-except ImportError:
-    from project_paths import (  # type: ignore
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
+from project_paths import (
+    GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
+    RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
+    GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
+    RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
+    RESULTS_DIR,
+    ensure_base_dirs,
+)
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -74,13 +64,16 @@ N_MELS           = 128
 IMG_SIZE         = 128
 INPUT_SIZE       = IMG_SIZE * IMG_SIZE            # 16384
 
-HIDDEN_SIZE      = 64
+HIDDEN_SIZE      = 5
 OUTPUT_SIZE      = 1
 
 LEARNING_RATE    = 0.01
 EPOCHS           = 100
 SILENCE_TOP_DB   = 20
 LEAKY_RELU_ALPHA = 0.01
+VAL_SPLIT        = 0.2
+EARLY_STOP_PATIENCE  = 12
+EARLY_STOP_MIN_DELTA = 1e-4
 
 # ── Audio file paths ──────────────────────────
 GABRIEL_TRAIN_FILE = PROJECT_GABRIEL_TRAIN_FILE
@@ -304,6 +297,48 @@ def build_test_dataset(gabriel_clips: list, raiz_clips: list) -> tuple:
     return X, y
 
 
+def split_train_validation(X: np.ndarray, y: np.ndarray,
+                           val_split: float = VAL_SPLIT) -> tuple:
+    """
+    Stratified split of training set into train/validation subsets.
+    Validation is used for activation selection and early stopping.
+    """
+    if not 0.0 < val_split < 1.0:
+        raise ValueError("val_split must be between 0 and 1.")
+
+    idx0 = np.where(y == GABRIEL_LABEL)[0]
+    idx1 = np.where(y == RAIZ_LABEL)[0]
+    np.random.shuffle(idx0)
+    np.random.shuffle(idx1)
+
+    n0_val = max(1, int(len(idx0) * val_split))
+    n1_val = max(1, int(len(idx1) * val_split))
+    n0_val = min(n0_val, len(idx0) - 1)
+    n1_val = min(n1_val, len(idx1) - 1)
+
+    val_idx = np.concatenate([idx0[:n0_val], idx1[:n1_val]])
+    fit_idx = np.concatenate([idx0[n0_val:], idx1[n1_val:]])
+    np.random.shuffle(val_idx)
+    np.random.shuffle(fit_idx)
+
+    X_fit, y_fit = X[fit_idx], y[fit_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+
+    print(
+        f"  Train/Val split ({int(val_split*100)}%) — "
+        f"Train: {len(X_fit)} | Val: {len(X_val)}"
+    )
+    print(
+        f"    Train classes — Gabriel: {int(np.sum(y_fit==0))}, "
+        f"Raiz: {int(np.sum(y_fit==1))}"
+    )
+    print(
+        f"    Val classes   — Gabriel: {int(np.sum(y_val==0))}, "
+        f"Raiz: {int(np.sum(y_val==1))}"
+    )
+    return X_fit, y_fit, X_val, y_val
+
+
 # ─────────────────────────────────────────────
 # GLOBAL NORMALIZATION
 # ─────────────────────────────────────────────
@@ -327,15 +362,35 @@ def apply_normalizer(X: np.ndarray, mean: np.ndarray,
     return ((X - mean) / std).astype(np.float32)
 
 
+def save_trained_model(path: str, params: dict, threshold: float,
+                       norm_mean: np.ndarray, norm_std: np.ndarray,
+                       hidden_activation: str):
+    """Persist trained weights + threshold + normalizer for live inference."""
+    np.savez(
+        path,
+        W1=params["W1"].astype(np.float32),
+        b1=params["b1"].astype(np.float32),
+        W2=params["W2"].astype(np.float32),
+        b2=params["b2"].astype(np.float32),
+        threshold=np.array(threshold, dtype=np.float32),
+        norm_mean=norm_mean.astype(np.float32),
+        norm_std=norm_std.astype(np.float32),
+        hidden_activation=np.array(hidden_activation),
+        sample_rate=np.array(SAMPLE_RATE, dtype=np.int32),
+        clip_duration=np.array(CLIP_DURATION, dtype=np.int32),
+    )
+    print(f"  Saved selected model: {path}")
+
+
 # ─────────────────────────────────────────────
 # STEP 5: MANUAL 2-LAYER NEURAL NETWORK (NumPy only)
 # ─────────────────────────────────────────────
 # Architecture:
-#   Input (16384) → Hidden (64, activation_fn) → Output (1, sigmoid)
+#   Input (16384) → Hidden (HIDDEN_SIZE, activation_fn) → Output (1, sigmoid)
 #
 # Forward pass:
-#   Z1 = X · W1 + b1              shape: (N, 64)
-#   A1 = hidden_activation(Z1)    shape: (N, 64)
+#   Z1 = X · W1 + b1              shape: (N, HIDDEN_SIZE)
+#   A1 = hidden_activation(Z1)    shape: (N, HIDDEN_SIZE)
 #   Z2 = A1 · W2 + b2             shape: (N, 1)
 #   A2 = sigmoid(Z2)              shape: (N, 1)  ← output probability
 #
@@ -410,11 +465,11 @@ def backward_pass(X: np.ndarray, y: np.ndarray, params: dict,
 
     # ── Output layer ──
     dZ2 = A2 - y                              # (N, 1)
-    dW2 = (A1.T @ dZ2) / N                   # (64, 1)
+    dW2 = (A1.T @ dZ2) / N                   # (HIDDEN_SIZE, 1)
     db2 = np.mean(dZ2, axis=0, keepdims=True) # (1, 1)
 
     # ── Hidden layer ──
-    dA1 = dZ2 @ params["W2"].T               # (N, 64)
+    dA1 = dZ2 @ params["W2"].T               # (N, HIDDEN_SIZE)
 
     # ReLU/Leaky ReLU derivatives need Z1 (pre-activation), not A1.
     # Sigmoid/Tanh derivatives are expressed in terms of A1 (post-activation).
@@ -423,8 +478,8 @@ def backward_pass(X: np.ndarray, y: np.ndarray, params: dict,
     else:
         dZ1 = dA1 * deriv_fn(A1)
 
-    dW1 = (X.T @ dZ1) / N                    # (16384, 64)
-    db1 = np.mean(dZ1, axis=0, keepdims=True) # (1, 64)
+    dW1 = (X.T @ dZ1) / N                    # (16384, HIDDEN_SIZE)
+    db1 = np.mean(dZ1, axis=0, keepdims=True) # (1, HIDDEN_SIZE)
 
     return {"dW1": dW1, "db1": db1, "dW2": dW2, "db2": db2}
 
@@ -442,37 +497,68 @@ def predict(X: np.ndarray, params: dict, activation: str) -> np.ndarray:
     return A2.flatten()
 
 
-def train(X_train: np.ndarray, y_train: np.ndarray,
+def train(X_fit: np.ndarray, y_fit: np.ndarray,
+          X_val: np.ndarray, y_val: np.ndarray,
           activation: str) -> tuple:
     label = ACTIVATION_LABELS[activation]
     print(f"\n[STEP 5] Training — hidden activation: {label}")
     print(f"  Architecture : {INPUT_SIZE} → {HIDDEN_SIZE}({label}) → {OUTPUT_SIZE}(Sigmoid)")
     print(f"  Epochs       : {EPOCHS}  |  LR: {LEARNING_RATE}")
-    print(f"  Train samples: {len(X_train)}\n")
+    print(f"  Train samples: {len(X_fit)}  |  Val samples: {len(X_val)}")
+    print(
+        f"  Early stop   : patience={EARLY_STOP_PATIENCE}, "
+        f"min_delta={EARLY_STOP_MIN_DELTA}\n"
+    )
 
     np.random.seed(SEED)   # reset seed per run for fair comparison
     params  = initialize_weights(activation)
-    history = {"loss": [], "accuracy": []}
+    history = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+    best_params = {k: v.copy() for k, v in params.items()}
+    best_val_loss = np.inf
+    best_epoch = 0
+    stale_epochs = 0
 
     for epoch in range(1, EPOCHS + 1):
-        A2, cache = forward_pass(X_train, params, activation)
-        loss      = binary_cross_entropy(y_train, A2.flatten())
+        A2, cache = forward_pass(X_fit, params, activation)
+        loss      = binary_cross_entropy(y_fit, A2.flatten())
         preds     = (A2.flatten() >= 0.5).astype(int)
-        accuracy  = np.mean(preds == y_train.astype(int))
+        accuracy  = np.mean(preds == y_fit.astype(int))
+
+        val_probs, _ = forward_pass(X_val, params, activation)
+        val_loss = binary_cross_entropy(y_val, val_probs.flatten())
+        val_preds = (val_probs.flatten() >= 0.5).astype(int)
+        val_accuracy = np.mean(val_preds == y_val.astype(int))
 
         history["loss"].append(loss)
         history["accuracy"].append(accuracy)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_accuracy)
 
-        grads  = backward_pass(X_train, y_train, params, cache, activation)
+        grads  = backward_pass(X_fit, y_fit, params, cache, activation)
         params = update_weights(params, grads)
+
+        if val_loss < (best_val_loss - EARLY_STOP_MIN_DELTA):
+            best_val_loss = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
+            best_params = {k: v.copy() for k, v in params.items()}
+        else:
+            stale_epochs += 1
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:4d}/{EPOCHS}"
                   f"  |  Loss: {loss:.6f}"
-                  f"  |  Train Accuracy: {accuracy*100:.2f}%")
+                  f"  |  Train Accuracy: {accuracy*100:.2f}%"
+                  f"  |  Val Loss: {val_loss:.6f}"
+                  f"  |  Val Acc: {val_accuracy*100:.2f}%")
 
-    print(f"\n  Training complete ({label}).")
-    return params, history
+        if stale_epochs >= EARLY_STOP_PATIENCE:
+            print(f"  Early stopping at epoch {epoch} (best epoch: {best_epoch})")
+            break
+
+    params = best_params
+    print(f"\n  Training complete ({label}). Best epoch: {best_epoch}")
+    return params, history, best_epoch
 
 
 # ─────────────────────────────────────────────
@@ -498,6 +584,27 @@ def compute_roc(y_true: np.ndarray, y_scores: np.ndarray) -> tuple:
     return fprs, tprs, abs(np.trapezoid(tprs, fprs))
 
 
+def select_threshold_by_youden(y_true: np.ndarray, y_scores: np.ndarray) -> float:
+    """Select threshold maximizing Youden's J statistic."""
+    thresholds = np.linspace(0, 1, 500)
+    pos = np.sum(y_true == 1)
+    neg = np.sum(y_true == 0)
+
+    best_thresh = 0.5
+    best_j = -np.inf
+    for thresh in thresholds:
+        preds = (y_scores >= thresh).astype(int)
+        tp = np.sum((preds == 1) & (y_true == 1))
+        fp = np.sum((preds == 1) & (y_true == 0))
+        tpr = tp / pos if pos > 0 else 0.0
+        fpr = fp / neg if neg > 0 else 0.0
+        j = tpr - fpr
+        if j > best_j:
+            best_j = j
+            best_thresh = float(thresh)
+    return best_thresh
+
+
 def compute_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
     """Return [[TN, FP], [FN, TP]]."""
     cm = np.zeros((2, 2), dtype=int)
@@ -513,14 +620,19 @@ def plot_training_curves(history: dict, activation: str, out_dir: str):
     epochs = range(1, len(history["loss"]) + 1)
 
     axes[0].plot(epochs, history["loss"], color="#e74c3c", linewidth=2)
-    axes[0].set_title("Training Loss (Binary Cross-Entropy)")
+    axes[0].plot(epochs, history["val_loss"], color="#2c3e50", linewidth=2)
+    axes[0].set_title("Loss (Binary Cross-Entropy)")
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
+    axes[0].legend(["Train", "Validation"])
     axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(epochs, [a*100 for a in history["accuracy"]],
                  color="#2980b9", linewidth=2)
-    axes[1].set_title("Training Accuracy")
+    axes[1].plot(epochs, [a*100 for a in history["val_accuracy"]],
+                 color="#16a085", linewidth=2)
+    axes[1].set_title("Accuracy")
     axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Accuracy (%)")
+    axes[1].legend(["Train", "Validation"])
     axes[1].set_ylim([0, 105]); axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -609,8 +721,10 @@ def plot_attribute_heatmap(params: dict, activation: str, out_dir: str):
 
 
 def save_run_report(cm: np.ndarray, auc: float, y_true: np.ndarray,
-                    y_pred: np.ndarray, n_train: int,
-                    activation: str, out_dir: str) -> dict:
+                    y_pred: np.ndarray, n_train: int, n_val: int,
+                    activation: str, out_dir: str, params: dict,
+                    threshold: float, best_epoch: int,
+                    val_accuracy: float, val_auc: float) -> dict:
     """Save per-run evaluation report and return metrics dict."""
     label = ACTIVATION_LABELS[activation]
     tn, fp, fn, tp = cm[0,0], cm[0,1], cm[1,0], cm[1,1]
@@ -631,11 +745,16 @@ def save_run_report(cm: np.ndarray, auc: float, y_true: np.ndarray,
         f"Architecture  : {INPUT_SIZE} -> {HIDDEN_SIZE}({label}) -> {OUTPUT_SIZE}(Sigmoid)",
         f"Epochs        : {EPOCHS}",
         f"Learning rate : {LEARNING_RATE}",
+        f"Best epoch    : {best_epoch}",
         f"Sample rate   : {SAMPLE_RATE} Hz",
         f"Spectrogram   : {IMG_SIZE}x{IMG_SIZE} Mel",
         f"Train samples : {n_train}",
+        f"Val samples   : {n_val}",
         f"Test samples  : {total}",
         "=" * 55,
+        f"Validation Accuracy : {val_accuracy*100:.2f}%",
+        f"Validation AUC      : {val_auc:.4f}",
+        f"Threshold (Val J)   : {threshold:.4f}",
         f"Accuracy      : {accuracy*100:.2f}%",
         f"AUC           : {auc:.4f}",
         "-" * 55,
@@ -655,65 +774,93 @@ def save_run_report(cm: np.ndarray, auc: float, y_true: np.ndarray,
 
     return {
         "activation": label,
+        "activation_key": activation,
         "accuracy":   accuracy,
         "auc":        auc,
+        "val_accuracy": float(val_accuracy),
+        "val_auc": float(val_auc),
+        "threshold": float(threshold),
+        "best_epoch": int(best_epoch),
         "f1_gabriel": f1_g,
         "f1_raiz":    f1_r,
+        "params": params,
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
     }
 
 
 def print_comparison_table(results: list):
     """Print a final summary table comparing all activation function runs."""
-    sep = "=" * 75
+    sep = "=" * 95
     print(f"\n\n{sep}")
-    print("  FINAL COMPARISON — ALL ACTIVATION FUNCTIONS")
+    print("  FINAL COMPARISON — ACTIVATION SELECTION (BY VALIDATION)")
     print(sep)
-    print(f"  {'Activation':<22} {'Accuracy':>10} {'AUC':>8} "
-          f"{'F1 Gabriel':>12} {'F1 Raiz':>10}")
-    print("-" * 75)
+    print(
+        f"  {'Activation':<22} {'Val Acc':>9} {'Val AUC':>8} "
+        f"{'Test Acc':>10} {'Test AUC':>9} {'Best Ep':>8}"
+    )
+    print("-" * 95)
 
-    # Sort by accuracy descending
-    for r in sorted(results, key=lambda x: x["accuracy"], reverse=True):
-        print(f"  {r['activation']:<22} "
-              f"{r['accuracy']*100:>9.2f}% "
-              f"{r['auc']:>8.4f} "
-              f"{r['f1_gabriel']:>12.4f} "
-              f"{r['f1_raiz']:>10.4f}")
+    for r in sorted(results, key=lambda x: x["val_accuracy"], reverse=True):
+        print(
+            f"  {r['activation']:<22} "
+            f"{r['val_accuracy']*100:>8.2f}% "
+            f"{r['val_auc']:>8.4f} "
+            f"{r['accuracy']*100:>9.2f}% "
+            f"{r['auc']:>9.4f} "
+            f"{r['best_epoch']:>8d}"
+        )
 
     print(sep)
-    best = max(results, key=lambda x: x["accuracy"])
-    print(f"\n  Best accuracy : {best['activation']} ({best['accuracy']*100:.2f}%)")
-    best_auc = max(results, key=lambda x: x["auc"])
-    print(f"  Best AUC      : {best_auc['activation']} ({best_auc['auc']:.4f})")
+    best = max(results, key=lambda x: x["val_accuracy"])
+    print(
+        f"\n  Selected activation (validation): {best['activation']} "
+        f"(Val Acc: {best['val_accuracy']*100:.2f}%, Val AUC: {best['val_auc']:.4f})"
+    )
+    print(
+        f"  Selected model test performance: "
+        f"Acc {best['accuracy']*100:.2f}% | AUC {best['auc']:.4f}"
+    )
     print(sep + "\n")
 
-    # Save comparison to file
     comp_path = os.path.join(BASE_OUTPUT_DIR, "comparison_summary.txt")
     with open(comp_path, "w") as f:
-        f.write("FINAL COMPARISON — ALL ACTIVATION FUNCTIONS\n")
-        f.write("=" * 75 + "\n")
-        f.write(f"{'Activation':<22} {'Accuracy':>10} {'AUC':>8} "
-                f"{'F1 Gabriel':>12} {'F1 Raiz':>10}\n")
-        f.write("-" * 75 + "\n")
-        for r in sorted(results, key=lambda x: x["accuracy"], reverse=True):
-            f.write(f"{r['activation']:<22} "
-                    f"{r['accuracy']*100:>9.2f}% "
-                    f"{r['auc']:>8.4f} "
-                    f"{r['f1_gabriel']:>12.4f} "
-                    f"{r['f1_raiz']:>10.4f}\n")
-        f.write("=" * 75 + "\n")
-        f.write(f"Best accuracy : {best['activation']} ({best['accuracy']*100:.2f}%)\n")
-        f.write(f"Best AUC      : {best_auc['activation']} ({best_auc['auc']:.4f})\n")
+        f.write("FINAL COMPARISON — ACTIVATION SELECTION (BY VALIDATION)\n")
+        f.write("=" * 95 + "\n")
+        f.write(
+            f"{'Activation':<22} {'Val Acc':>9} {'Val AUC':>8} "
+            f"{'Test Acc':>10} {'Test AUC':>9} {'Best Ep':>8}\n"
+        )
+        f.write("-" * 95 + "\n")
+        for r in sorted(results, key=lambda x: x["val_accuracy"], reverse=True):
+            f.write(
+                f"{r['activation']:<22} "
+                f"{r['val_accuracy']*100:>8.2f}% "
+                f"{r['val_auc']:>8.4f} "
+                f"{r['accuracy']*100:>9.2f}% "
+                f"{r['auc']:>9.4f} "
+                f"{r['best_epoch']:>8d}\n"
+            )
+        f.write("=" * 95 + "\n")
+        f.write(
+            f"Selected activation (validation): {best['activation']} "
+            f"(Val Acc: {best['val_accuracy']*100:.2f}%, Val AUC: {best['val_auc']:.4f})\n"
+        )
+        f.write(
+            f"Selected model test performance: "
+            f"Acc {best['accuracy']*100:.2f}% | AUC {best['auc']:.4f}\n"
+        )
     print(f"  Comparison saved: {comp_path}")
+    return best
 
 
 # ─────────────────────────────────────────────
 # SINGLE ACTIVATION RUN
 # ─────────────────────────────────────────────
 
-def run_one(activation: str, X_train: np.ndarray, y_train: np.ndarray,
-            X_test: np.ndarray, y_test: np.ndarray, n_train: int) -> dict:
+def run_one(activation: str, X_fit: np.ndarray, y_fit: np.ndarray,
+            X_val: np.ndarray, y_val: np.ndarray,
+            X_test: np.ndarray, y_test: np.ndarray,
+            n_train: int, n_val: int) -> dict:
     """
     Execute a complete train/evaluate cycle for one activation function.
     Saves all outputs to results/multifunction/<activation_name>/.
@@ -729,12 +876,20 @@ def run_one(activation: str, X_train: np.ndarray, y_train: np.ndarray,
     print(f"{'='*55}")
 
     # Train
-    params, history = train(X_train, y_train, activation)
+    params, history, best_epoch = train(X_fit, y_fit, X_val, y_val, activation)
 
     # Evaluate
     print(f"\n[STEP 6 — {label}] Evaluating on test set ...")
+    val_scores = predict(X_val, params, activation)
+    threshold = select_threshold_by_youden(y_val, val_scores)
+    _, _, val_auc = compute_roc(y_val, val_scores)
+    val_pred = (val_scores >= threshold).astype(int)
+    val_accuracy = float(np.mean(val_pred == y_val.astype(int)))
+    print(f"  Validation threshold (Youden J): {threshold:.4f}")
+    print(f"  Validation Accuracy: {val_accuracy*100:.2f}%  |  Validation AUC: {val_auc:.4f}")
+
     y_scores = predict(X_test, params, activation)
-    y_pred   = (y_scores >= 0.5).astype(int)
+    y_pred   = (y_scores >= threshold).astype(int)
 
     fprs, tprs, auc = compute_roc(y_test, y_scores)
     cm              = compute_confusion_matrix(y_test, y_pred)
@@ -750,7 +905,18 @@ def run_one(activation: str, X_train: np.ndarray, y_train: np.ndarray,
     plot_attribute_heatmap(params, activation, out_dir)
 
     # Report
-    return save_run_report(cm, auc, y_test, y_pred, n_train, activation, out_dir)
+    return save_run_report(
+        cm, auc, y_test, y_pred,
+        n_train=n_train,
+        n_val=n_val,
+        activation=activation,
+        out_dir=out_dir,
+        params=params,
+        threshold=threshold,
+        best_epoch=best_epoch,
+        val_accuracy=val_accuracy,
+        val_auc=val_auc,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -809,28 +975,47 @@ def main():
     X_train, y_train = build_train_dataset(gabriel_train, raiz_train)
     X_test,  y_test  = build_test_dataset(gabriel_test,  raiz_test)
 
+    print("\n[VAL] Creating train/validation split from raw training set ...")
+    X_fit, y_fit, X_val, y_val = split_train_validation(X_train, y_train, VAL_SPLIT)
+
     # ── Global normalization ──────────────────
-    print("\n[NORM] Fitting global normalizer on training set ...")
-    norm_mean, norm_std = fit_normalizer(X_train)
-    X_train = apply_normalizer(X_train, norm_mean, norm_std)
+    # Fit stats on train-fit only to avoid validation leakage.
+    print("\n[NORM] Fitting global normalizer on train-fit set only ...")
+    norm_mean, norm_std = fit_normalizer(X_fit)
+    X_fit = apply_normalizer(X_fit, norm_mean, norm_std)
+    X_val = apply_normalizer(X_val, norm_mean, norm_std)
     X_test  = apply_normalizer(X_test,  norm_mean, norm_std)
-    print("  Normalization applied to train and test sets.")
+    print("  Normalization applied to train-fit, validation, and test sets.")
 
     # ── STEPS 5 & 6: One run per activation ──
     all_results = []
     for activation in ACTIVATION_FUNCTIONS:
         result = run_one(
             activation=activation,
-            X_train=X_train,
-            y_train=y_train,
+            X_fit=X_fit,
+            y_fit=y_fit,
+            X_val=X_val,
+            y_val=y_val,
             X_test=X_test,
             y_test=y_test,
-            n_train=len(X_train),
+            n_train=len(X_fit),
+            n_val=len(X_val),
         )
         all_results.append(result)
 
     # ── Final comparison table ────────────────
-    print_comparison_table(all_results)
+    best = print_comparison_table(all_results)
+
+    selected_model_path = os.path.join(BASE_OUTPUT_DIR, "trained_updated_model.npz")
+    save_trained_model(
+        selected_model_path,
+        best["params"],
+        best["threshold"],
+        norm_mean,
+        norm_std,
+        best["activation_key"],
+    )
+    print(f"  Selected activation model saved for live inference: {selected_model_path}")
 
     print(f"  Output structure:")
     for activation in ACTIVATION_FUNCTIONS:
@@ -838,6 +1023,7 @@ def main():
         print(f"      training_curves.png, roc_curve.png, "
               f"confusion_matrix.png, attribute_heatmap.png, evaluation_report.txt")
     print(f"    {BASE_OUTPUT_DIR}/comparison_summary.txt")
+    print(f"    {BASE_OUTPUT_DIR}/trained_updated_model.npz")
     print("\n  Done.\n")
 
 

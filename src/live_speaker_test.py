@@ -1,16 +1,13 @@
 """
-Live microphone speaker test for the updated voice classifier.
+Live microphone speaker test using the manual classifier pipeline.
 
 Usage examples:
-  python live_speaker_test.py
-  python live_speaker_test.py --retrain
-  python live_speaker_test.py --once
-  python live_speaker_test.py --window-seconds 5 --hop-seconds 1
+  python src/live_speaker_test.py
+  python src/live_speaker_test.py --retrain
+  python src/live_speaker_test.py --once
 """
 
 import argparse
-import importlib
-import inspect
 import os
 import sys
 import threading
@@ -20,140 +17,45 @@ from collections import deque
 import numpy as np
 
 try:
-    from .project_paths import (
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
-except ImportError:
-    from project_paths import (  # type: ignore
-        GABRIEL_TRAIN_FILE as PROJECT_GABRIEL_TRAIN_FILE,
-        RAIZ_TRAIN_FILE as PROJECT_RAIZ_TRAIN_FILE,
-        GABRIEL_TEST_FILE as PROJECT_GABRIEL_TEST_FILE,
-        RAIZ_TEST_FILE as PROJECT_RAIZ_TEST_FILE,
-        RESULTS_DIR,
-        ensure_base_dirs,
-    )
-
-try:
     import sounddevice as sd
 except ImportError:
     print("ERROR: Missing dependency 'sounddevice'.")
     print("Install it with: pip install sounddevice")
     sys.exit(1)
 
-def load_classifier_module():
-    """
-    Load classifier module with fallback names so file renames don't break live test.
-    Priority:
-      1) $SPEAKER_CLASSIFIER_MODULE (if set)
-      2) updated_classifier
-      3) manuel_classifier
-      4) manual_classifier
-    """
-    candidates = []
-    env_name = os.environ.get("SPEAKER_CLASSIFIER_MODULE", "").strip()
-    if env_name:
-        candidates.append(env_name)
-    base_candidates = [
-        "updated_classifier",
-        "manuel_classifier",
-        "manual_classifier",
-        "multifunction_classifier",
-    ]
-    candidates.extend(base_candidates)
-    candidates.extend([f"src.{name}" for name in base_candidates])
-
-    seen = set()
-    for name in candidates:
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        try:
-            module = importlib.import_module(name)
-            if name != "updated_classifier":
-                print(f"Using classifier module: {name}")
-            return module
-        except ModuleNotFoundError:
-            continue
-
-    print("ERROR: Could not import classifier module.")
-    print(
-        "Expected one of: updated_classifier.py, manuel_classifier.py, "
-        "manual_classifier.py, multifunction_classifier.py."
-    )
-    print("Or set env var SPEAKER_CLASSIFIER_MODULE=<your_module_name>.")
-    sys.exit(1)
-
-
-uc = load_classifier_module()
-
-ensure_base_dirs()
-DEFAULT_LIVE_MODEL_PATH = str(RESULTS_DIR / "live" / "trained_live_model.npz")
-LEGACY_LIVE_MODEL_PATH = str(RESULTS_DIR / "live" / "trained_updated_model.npz")
-os.makedirs(os.path.dirname(DEFAULT_LIVE_MODEL_PATH), exist_ok=True)
-
-
-MODEL_PATH = getattr(uc, "MODEL_PATH", None)
-if not MODEL_PATH:
-    module_output_dir = getattr(uc, "OUTPUT_DIR", None) or getattr(uc, "BASE_OUTPUT_DIR", None)
-    if module_output_dir:
-        MODEL_PATH = os.path.join(module_output_dir, "trained_updated_model.npz")
-    else:
-        MODEL_PATH = DEFAULT_LIVE_MODEL_PATH
-
-
-def _detect_predict_needs_activation() -> bool:
-    predict_fn = getattr(uc, "predict", None)
-    if predict_fn is None:
-        return False
-    try:
-        sig = inspect.signature(predict_fn)
-    except (TypeError, ValueError):
-        return False
-
-    params = list(sig.parameters.values())
-    if len(params) >= 3:
-        return True
-    return any(p.name == "activation" for p in params)
-
-
-PREDICT_NEEDS_ACTIVATION = _detect_predict_needs_activation()
-MODULE_ACTIVATIONS = list(getattr(uc, "ACTIVATION_FUNCTIONS", []))
-DEFAULT_HIDDEN_ACTIVATION = (
-    os.environ.get("SPEAKER_HIDDEN_ACTIVATION", "").strip()
-    or ("sigmoid" if "sigmoid" in MODULE_ACTIVATIONS else (MODULE_ACTIVATIONS[0] if MODULE_ACTIVATIONS else "sigmoid"))
+import manuel_classifier as uc
+from project_paths import (
+    GABRIEL_TRAIN_FILE,
+    GABRIEL_TEST_FILE,
+    RAIZ_TRAIN_FILE,
+    RAIZ_TEST_FILE,
+    RESULTS_DIR,
+    ensure_base_dirs,
 )
 
 
-def load_saved_model(path: str):
-    """Load model params, threshold, and normalizer stats from disk."""
-    if hasattr(uc, "load_saved_model"):
-        loaded = uc.load_saved_model(path)
-        if loaded is None:
-            return None, None, None, None
-        if isinstance(loaded, tuple) and len(loaded) == 4:
-            return loaded
-        if isinstance(loaded, tuple) and len(loaded) == 2:
-            params, threshold = loaded
-            input_size = int(params["W1"].shape[0])
-            return (
-                params,
-                float(threshold),
-                np.zeros(input_size, dtype=np.float32),
-                np.ones(input_size, dtype=np.float32),
-            )
+ensure_base_dirs()
+LIVE_RESULTS_DIR = os.path.join(str(RESULTS_DIR), "live")
+os.makedirs(LIVE_RESULTS_DIR, exist_ok=True)
 
+MODEL_CANDIDATES = [
+    os.path.join(LIVE_RESULTS_DIR, "trained_live_model.npz"),
+    os.path.join(LIVE_RESULTS_DIR, "trained_updated_model.npz"),
+    os.path.join(str(RESULTS_DIR), "manual", "trained_updated_model.npz"),
+    os.path.join(str(RESULTS_DIR), "multifunction", "trained_updated_model.npz"),
+    os.path.join(str(RESULTS_DIR), "manual", "trained_manual_model.npz"),
+]
+
+
+def load_saved_model(path: str):
+    """Load model params, threshold, normalizer stats, and optional activation."""
     if not os.path.exists(path):
-        return None, None, None, None
+        return None, None, None, None, None
 
     data = np.load(path)
     required = {"W1", "b1", "W2", "b2", "threshold"}
     if not required.issubset(set(data.files)):
-        return None, None, None, None
+        return None, None, None, None, None
 
     params = {
         "W1": data["W1"].astype(np.float32),
@@ -164,96 +66,75 @@ def load_saved_model(path: str):
     threshold = float(data["threshold"])
 
     input_size = int(params["W1"].shape[0])
-    norm_mean = data["norm_mean"].astype(np.float32) if "norm_mean" in data.files else np.zeros(input_size, dtype=np.float32)
-    norm_std = data["norm_std"].astype(np.float32) if "norm_std" in data.files else np.ones(input_size, dtype=np.float32)
-    return params, threshold, norm_mean, norm_std
+    norm_mean = (
+        data["norm_mean"].astype(np.float32)
+        if "norm_mean" in data.files
+        else np.zeros(input_size, dtype=np.float32)
+    )
+    norm_std = (
+        data["norm_std"].astype(np.float32)
+        if "norm_std" in data.files
+        else np.ones(input_size, dtype=np.float32)
+    )
+    hidden_activation = None
+    if "hidden_activation" in data.files:
+        hidden_activation = str(data["hidden_activation"])
+        if hidden_activation.startswith("b'") and hidden_activation.endswith("'"):
+            hidden_activation = hidden_activation[2:-1]
+        hidden_activation = hidden_activation.strip().lower()
+    return params, threshold, norm_mean, norm_std, hidden_activation
 
 
 def ensure_training_files_exist():
-    """Ensure the four source files required by updated_classifier are present."""
-    required = [
-        getattr(uc, "GABRIEL_TRAIN_FILE", PROJECT_GABRIEL_TRAIN_FILE),
-        getattr(uc, "RAIZ_TRAIN_FILE", PROJECT_RAIZ_TRAIN_FILE),
-        getattr(uc, "GABRIEL_TEST_FILE", PROJECT_GABRIEL_TEST_FILE),
-        getattr(uc, "RAIZ_TEST_FILE", PROJECT_RAIZ_TEST_FILE),
-    ]
+    required = [GABRIEL_TRAIN_FILE, RAIZ_TRAIN_FILE, GABRIEL_TEST_FILE, RAIZ_TEST_FILE]
     missing = [fname for fname in required if not os.path.exists(fname)]
     if missing:
-        missing_list = ", ".join(missing)
         raise FileNotFoundError(
-            f"Missing required audio file(s) for retraining/testing: {missing_list}"
+            "Missing required audio file(s): " + ", ".join(missing)
         )
 
 
-def train_and_cache_model(path: str):
-    """
-    Run the full updated_classifier pipeline (train + test + save),
-    then load the saved model artifact for live use.
-    """
-    ensure_training_files_exist()
-    if not hasattr(uc, "main"):
-        raise RuntimeError("Selected classifier module does not expose main().")
+def find_cached_model():
+    for path in MODEL_CANDIDATES:
+        params, threshold, norm_mean, norm_std, hidden_activation = load_saved_model(path)
+        if params is not None:
+            return path, params, threshold, norm_mean, norm_std, hidden_activation
+    return None, None, None, None, None, None
 
+
+def train_and_cache_model():
+    ensure_training_files_exist()
     print("Running classifier full pipeline to train/test model...")
     uc.main()
 
-    candidate_paths = [
-        path,
-        DEFAULT_LIVE_MODEL_PATH,
-        LEGACY_LIVE_MODEL_PATH,
-        os.path.join(str(RESULTS_DIR / "manual"), "trained_updated_model.npz"),
-        os.path.join(str(RESULTS_DIR / "manual"), "trained_manual_model.npz"),
-    ]
-
-    params = threshold = norm_mean = norm_std = None
-    loaded_path = None
-    for model_path in candidate_paths:
-        params, threshold, norm_mean, norm_std = load_saved_model(model_path)
-        if params is not None:
-            loaded_path = model_path
-            break
-
+    loaded_path, params, threshold, norm_mean, norm_std, hidden_activation = find_cached_model()
     if params is None:
-        raise RuntimeError(
-            "classifier completed but no valid saved model was found at "
-            f"{path}"
-        )
+        raise RuntimeError("No valid saved model found after retraining.")
 
     print(f"Loaded freshly trained model: {loaded_path}")
     print(f"Using threshold: {threshold:.4f}")
-    return params, threshold, norm_mean, norm_std
+    if hidden_activation:
+        print(f"Model hidden activation: {hidden_activation}")
+    return params, threshold, norm_mean, norm_std, hidden_activation
 
 
 def get_model(force_retrain: bool):
-    """Load cached model if possible; otherwise train and cache."""
     if not force_retrain:
-        candidate_paths = [
-            MODEL_PATH,
-            DEFAULT_LIVE_MODEL_PATH,
-            LEGACY_LIVE_MODEL_PATH,
-            os.path.join(str(RESULTS_DIR / "manual"), "trained_updated_model.npz"),
-            os.path.join(str(RESULTS_DIR / "manual"), "trained_manual_model.npz"),
-        ]
-        for model_path in candidate_paths:
-            params, threshold, norm_mean, norm_std = load_saved_model(model_path)
-            if params is not None:
-                print(f"Loaded model cache: {model_path}")
-                print(f"Using threshold: {threshold:.4f}")
-                return params, threshold, norm_mean, norm_std
+        loaded_path, params, threshold, norm_mean, norm_std, hidden_activation = find_cached_model()
+        if params is not None:
+            print(f"Loaded model cache: {loaded_path}")
+            print(f"Using threshold: {threshold:.4f}")
+            if hidden_activation:
+                print(f"Model hidden activation: {hidden_activation}")
+            return params, threshold, norm_mean, norm_std, hidden_activation
 
-    return train_and_cache_model(MODEL_PATH)
+    return train_and_cache_model()
 
 
 def record_clip(seconds: int, sample_rate: int) -> np.ndarray:
-    """Record mono audio clip from default microphone."""
     n_samples = int(seconds * sample_rate)
     print(f"\nRecording for {seconds} seconds... speak now.")
-    audio = sd.rec(
-        n_samples,
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
-    )
+    audio = sd.rec(n_samples, samplerate=sample_rate, channels=1, dtype="float32")
     sd.wait()
     print("Recording complete.")
     return audio.reshape(-1)
@@ -261,11 +142,6 @@ def record_clip(seconds: int, sample_rate: int) -> np.ndarray:
 
 def prepare_live_clip(raw_audio: np.ndarray, target_samples: int,
                       apply_trim_silence: bool = True) -> np.ndarray:
-    """
-    Make live audio closer to training clips:
-    - trim silence
-    - ensure fixed length by crop/tile
-    """
     trimmed = uc.trim_silence(raw_audio) if apply_trim_silence else raw_audio
     if len(trimmed) == 0:
         trimmed = raw_audio
@@ -276,8 +152,7 @@ def prepare_live_clip(raw_audio: np.ndarray, target_samples: int,
         return trimmed[:target_samples].astype(np.float32)
 
     reps = int(np.ceil(target_samples / len(trimmed)))
-    tiled = np.tile(trimmed, reps)[:target_samples]
-    return tiled.astype(np.float32)
+    return np.tile(trimmed, reps)[:target_samples].astype(np.float32)
 
 
 def classify_audio(
@@ -287,28 +162,22 @@ def classify_audio(
     norm_mean: np.ndarray,
     norm_std: np.ndarray,
     target_samples: int,
+    hidden_activation: str,
     apply_trim_silence: bool = True,
-    hidden_activation: str = DEFAULT_HIDDEN_ACTIVATION,
 ):
-    """Classify one audio array and return (speaker, score, confidence, margin)."""
     prepared = prepare_live_clip(
         raw_audio,
         target_samples,
         apply_trim_silence=apply_trim_silence,
     )
     feat = uc.clip_to_spectrogram(prepared).reshape(1, -1)
-    if hasattr(uc, "apply_normalizer"):
-        feat = uc.apply_normalizer(feat, norm_mean, norm_std)
-    if PREDICT_NEEDS_ACTIVATION:
-        score = float(uc.predict(feat, params, hidden_activation)[0])
-    else:
-        score = float(uc.predict(feat, params)[0])
+    feat = uc.apply_normalizer(feat, norm_mean, norm_std)
+    score = float(uc.predict(feat, params, hidden_activation)[0])
 
     pred = 1 if score >= threshold else 0
     speaker = "Raiz" if pred == 1 else "Gabriel"
     confidence = score if pred == 1 else (1.0 - score)
     margin = abs(score - threshold)
-
     return speaker, score, confidence, margin
 
 
@@ -320,18 +189,15 @@ def classify_clip(
     norm_std: np.ndarray,
     hidden_activation: str,
 ):
-    """Classify one recorded clip and print prediction."""
-    clip_duration = int(getattr(uc, "CLIP_DURATION", 5))
-    sample_rate = int(getattr(uc, "SAMPLE_RATE", 22050))
     speaker, score, confidence, margin = classify_audio(
         raw_audio,
         params,
         threshold,
         norm_mean,
         norm_std,
-        int(clip_duration * sample_rate),
-        apply_trim_silence=True,
+        int(uc.CLIP_DURATION * uc.SAMPLE_RATE),
         hidden_activation=hidden_activation,
+        apply_trim_silence=True,
     )
     print(f"Prediction: {speaker}")
     print(
@@ -345,6 +211,7 @@ def run_live_stream(
     threshold: float,
     norm_mean: np.ndarray,
     norm_std: np.ndarray,
+    hidden_activation: str,
     window_seconds: int,
     hop_seconds: float,
     min_rms: float,
@@ -354,25 +221,17 @@ def run_live_stream(
     live_trim_silence: bool,
     input_latency: str,
     infer_every: int,
-    hidden_activation: str,
 ):
-    """
-    Continuously read microphone audio and classify using a rolling window.
-    """
-    sample_rate = int(getattr(uc, "SAMPLE_RATE", 22050))
+    sample_rate = uc.SAMPLE_RATE
     window_samples = int(window_seconds * sample_rate)
-    hop_samples = int(hop_seconds * sample_rate)
 
     if window_samples <= 0:
         raise ValueError("window_seconds must be > 0")
-    if hop_samples <= 0:
+    if hop_seconds <= 0:
         raise ValueError("hop_seconds must be > 0")
-    if hop_samples > window_samples:
-        raise ValueError("hop_seconds must be <= window_seconds")
     if infer_every <= 0:
         raise ValueError("infer_every must be >= 1")
 
-    # Audio callback writes into a lock-protected ring buffer.
     max_buffer_samples = window_samples * 4
     ring_buffer = np.zeros(max_buffer_samples, dtype=np.float32)
     write_pos = 0
@@ -391,12 +250,11 @@ def run_live_stream(
         f"Smoothing: {max(1, smooth_votes)} | "
         f"Live trim silence: {live_trim_silence} | "
         f"Input latency: {input_latency} | "
-        f"Infer every: {infer_every} tick(s)"
+        f"Infer every: {infer_every} tick(s) | "
+        f"Hidden activation: {hidden_activation}"
     )
     print("Press Ctrl+C to stop.\n")
 
-    # Warm up feature extraction/inference once before real-time loop
-    # to avoid one-time startup stalls that can trigger an overflow warning.
     _ = classify_audio(
         np.zeros(window_samples, dtype=np.float32),
         params,
@@ -404,8 +262,8 @@ def run_live_stream(
         norm_mean,
         norm_std,
         window_samples,
-        apply_trim_silence=False,
         hidden_activation=hidden_activation,
+        apply_trim_silence=False,
     )
 
     def audio_callback(indata, frames, time_info, status):
@@ -446,10 +304,7 @@ def run_live_stream(
             if start < end:
                 return ring_buffer[start:end].copy()
 
-            return np.concatenate(
-                (ring_buffer[start:], ring_buffer[:end]),
-                axis=0,
-            ).astype(np.float32, copy=False)
+            return np.concatenate((ring_buffer[start:], ring_buffer[:end]), axis=0)
 
     with sd.InputStream(
         samplerate=sample_rate,
@@ -458,10 +313,10 @@ def run_live_stream(
         blocksize=0,
         latency=input_latency,
         callback=audio_callback,
-    ) as stream:
-        _ = stream
+    ):
         next_update = time.monotonic() + hop_seconds
         tick_index = 0
+
         while True:
             now = time.monotonic()
             if now < next_update:
@@ -473,8 +328,7 @@ def run_live_stream(
             if overflow_events > 0 and not overflow_warned:
                 print(
                     "WARNING: Audio input overflow detected. Predictions may be delayed. "
-                    "Try increasing --hop-seconds (e.g., 2.0+), keep --input-latency high, "
-                    "and close CPU-heavy apps."
+                    "Try higher --hop-seconds and --input-latency high."
                 )
                 overflow_warned = True
 
@@ -499,8 +353,8 @@ def run_live_stream(
                 norm_mean,
                 norm_std,
                 window_samples,
-                apply_trim_silence=live_trim_silence,
                 hidden_activation=hidden_activation,
+                apply_trim_silence=live_trim_silence,
             )
 
             if margin < min_margin:
@@ -530,121 +384,50 @@ def run_live_stream(
 
 
 def main():
-    default_clip_duration = int(getattr(uc, "CLIP_DURATION", 5))
-    default_sample_rate = int(getattr(uc, "SAMPLE_RATE", 22050))
-
     parser = argparse.ArgumentParser(description="Live mic speaker test (Gabriel vs Raiz).")
-    parser.add_argument(
-        "--retrain",
-        action="store_true",
-        help="Force retraining from source recordings before mic testing.",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Record and classify one clip, then exit.",
-    )
-    parser.add_argument(
-        "--seconds",
-        type=int,
-        default=default_clip_duration,
-        help=f"One-shot recording length for --once (default: {default_clip_duration}).",
-    )
-    parser.add_argument(
-        "--window-seconds",
-        type=int,
-        default=default_clip_duration,
-        help=f"Rolling window size for continuous mode (default: {default_clip_duration}).",
-    )
-    parser.add_argument(
-        "--hop-seconds",
-        type=float,
-        default=1.0,
-        help="Continuous mode update interval in seconds (default: 1.0).",
-    )
-    parser.add_argument(
-        "--min-rms",
-        type=float,
-        default=0.005,
-        help="Ignore low-energy audio below this RMS in continuous mode (default: 0.005).",
-    )
-    parser.add_argument(
-        "--min-margin",
-        type=float,
-        default=0.03,
-        help="Mark prediction as Uncertain if |score-threshold| is below this margin (default: 0.03).",
-    )
-    parser.add_argument(
-        "--smooth-votes",
-        type=int,
-        default=5,
-        help="Majority vote window size for stable live labels (default: 5).",
-    )
-    parser.add_argument(
-        "--print-all",
-        action="store_true",
-        help="Print every update (default prints only when speaker label changes).",
-    )
-    parser.add_argument(
-        "--live-trim-silence",
-        action="store_true",
-        help=(
-            "Apply silence trimming on each live window. This is slower and may cause "
-            "mic overflow on some systems; default is OFF for better realtime stability."
-        ),
-    )
-    parser.add_argument(
-        "--input-latency",
-        choices=["low", "high"],
-        default="high",
-        help=(
-            "Audio input latency hint for sounddevice (default: high). "
-            "Use high to reduce overflow risk; low reduces capture latency."
-        ),
-    )
-    parser.add_argument(
-        "--infer-every",
-        type=int,
-        default=1,
-        help=(
-            "Run model inference every N update ticks (default: 1). "
-            "Use 2 or 3 to reduce CPU load and improve realtime stability."
-        ),
-    )
+    parser.add_argument("--retrain", action="store_true", help="Force retraining before mic testing.")
+    parser.add_argument("--once", action="store_true", help="Record and classify one clip, then exit.")
+    parser.add_argument("--seconds", type=int, default=uc.CLIP_DURATION, help=f"One-shot seconds (default: {uc.CLIP_DURATION}).")
+    parser.add_argument("--window-seconds", type=int, default=uc.CLIP_DURATION, help=f"Rolling window seconds (default: {uc.CLIP_DURATION}).")
+    parser.add_argument("--hop-seconds", type=float, default=1.0, help="Continuous update interval in seconds (default: 1.0).")
+    parser.add_argument("--min-rms", type=float, default=0.005, help="Ignore low-energy audio below this RMS.")
+    parser.add_argument("--min-margin", type=float, default=0.03, help="Label Uncertain if |score-threshold| below this.")
+    parser.add_argument("--smooth-votes", type=int, default=5, help="Majority vote window size.")
+    parser.add_argument("--print-all", action="store_true", help="Print every update.")
+    parser.add_argument("--live-trim-silence", action="store_true", help="Apply silence trimming on each live window (slower).")
+    parser.add_argument("--input-latency", choices=["low", "high"], default="high", help="Audio input latency hint.")
+    parser.add_argument("--infer-every", type=int, default=1, help="Run inference every N update ticks.")
     parser.add_argument(
         "--hidden-activation",
-        type=str,
-        default=DEFAULT_HIDDEN_ACTIVATION,
-        help=(
-            "Hidden-layer activation used by classifier modules whose predict() requires it "
-            f"(default: {DEFAULT_HIDDEN_ACTIVATION})."
-        ),
+        choices=uc.ACTIVATION_FUNCTIONS,
+        default=None,
+        help="Override hidden activation used for predict(). Default uses saved model metadata.",
     )
     args = parser.parse_args()
 
-    if PREDICT_NEEDS_ACTIVATION and MODULE_ACTIVATIONS and args.hidden_activation not in MODULE_ACTIVATIONS:
-        print(
-            f"ERROR: --hidden-activation must be one of: {', '.join(MODULE_ACTIVATIONS)} "
-            f"(got: {args.hidden_activation})"
-        )
-        sys.exit(1)
-
     try:
-        params, threshold, norm_mean, norm_std = get_model(force_retrain=args.retrain)
+        params, threshold, norm_mean, norm_std, model_activation = get_model(force_retrain=args.retrain)
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
 
+    hidden_activation = args.hidden_activation or model_activation or "tanh"
+    if model_activation and args.hidden_activation and args.hidden_activation != model_activation:
+        print(
+            f"WARNING: Overriding saved activation '{model_activation}' "
+            f"with CLI activation '{args.hidden_activation}'."
+        )
+
     try:
         if args.once:
-            raw_audio = record_clip(args.seconds, default_sample_rate)
+            raw_audio = record_clip(args.seconds, uc.SAMPLE_RATE)
             classify_clip(
                 raw_audio,
                 params,
                 threshold,
                 norm_mean,
                 norm_std,
-                hidden_activation=args.hidden_activation,
+                hidden_activation=hidden_activation,
             )
             return
 
@@ -653,6 +436,7 @@ def main():
             threshold=threshold,
             norm_mean=norm_mean,
             norm_std=norm_std,
+            hidden_activation=hidden_activation,
             window_seconds=args.window_seconds,
             hop_seconds=args.hop_seconds,
             min_rms=args.min_rms,
@@ -662,7 +446,6 @@ def main():
             live_trim_silence=args.live_trim_silence,
             input_latency=args.input_latency,
             infer_every=args.infer_every,
-            hidden_activation=args.hidden_activation,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
