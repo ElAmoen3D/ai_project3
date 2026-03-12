@@ -10,6 +10,7 @@ Usage examples:
 
 import argparse
 import importlib
+import inspect
 import os
 import sys
 import threading
@@ -103,6 +104,29 @@ if not MODEL_PATH:
         MODEL_PATH = os.path.join(module_output_dir, "trained_updated_model.npz")
     else:
         MODEL_PATH = DEFAULT_LIVE_MODEL_PATH
+
+
+def _detect_predict_needs_activation() -> bool:
+    predict_fn = getattr(uc, "predict", None)
+    if predict_fn is None:
+        return False
+    try:
+        sig = inspect.signature(predict_fn)
+    except (TypeError, ValueError):
+        return False
+
+    params = list(sig.parameters.values())
+    if len(params) >= 3:
+        return True
+    return any(p.name == "activation" for p in params)
+
+
+PREDICT_NEEDS_ACTIVATION = _detect_predict_needs_activation()
+MODULE_ACTIVATIONS = list(getattr(uc, "ACTIVATION_FUNCTIONS", []))
+DEFAULT_HIDDEN_ACTIVATION = (
+    os.environ.get("SPEAKER_HIDDEN_ACTIVATION", "").strip()
+    or ("sigmoid" if "sigmoid" in MODULE_ACTIVATIONS else (MODULE_ACTIVATIONS[0] if MODULE_ACTIVATIONS else "sigmoid"))
+)
 
 
 def load_saved_model(path: str):
@@ -264,6 +288,7 @@ def classify_audio(
     norm_std: np.ndarray,
     target_samples: int,
     apply_trim_silence: bool = True,
+    hidden_activation: str = DEFAULT_HIDDEN_ACTIVATION,
 ):
     """Classify one audio array and return (speaker, score, confidence, margin)."""
     prepared = prepare_live_clip(
@@ -274,7 +299,10 @@ def classify_audio(
     feat = uc.clip_to_spectrogram(prepared).reshape(1, -1)
     if hasattr(uc, "apply_normalizer"):
         feat = uc.apply_normalizer(feat, norm_mean, norm_std)
-    score = float(uc.predict(feat, params)[0])
+    if PREDICT_NEEDS_ACTIVATION:
+        score = float(uc.predict(feat, params, hidden_activation)[0])
+    else:
+        score = float(uc.predict(feat, params)[0])
 
     pred = 1 if score >= threshold else 0
     speaker = "Raiz" if pred == 1 else "Gabriel"
@@ -290,6 +318,7 @@ def classify_clip(
     threshold: float,
     norm_mean: np.ndarray,
     norm_std: np.ndarray,
+    hidden_activation: str,
 ):
     """Classify one recorded clip and print prediction."""
     clip_duration = int(getattr(uc, "CLIP_DURATION", 5))
@@ -302,6 +331,7 @@ def classify_clip(
         norm_std,
         int(clip_duration * sample_rate),
         apply_trim_silence=True,
+        hidden_activation=hidden_activation,
     )
     print(f"Prediction: {speaker}")
     print(
@@ -323,6 +353,8 @@ def run_live_stream(
     print_all: bool,
     live_trim_silence: bool,
     input_latency: str,
+    infer_every: int,
+    hidden_activation: str,
 ):
     """
     Continuously read microphone audio and classify using a rolling window.
@@ -337,11 +369,14 @@ def run_live_stream(
         raise ValueError("hop_seconds must be > 0")
     if hop_samples > window_samples:
         raise ValueError("hop_seconds must be <= window_seconds")
+    if infer_every <= 0:
+        raise ValueError("infer_every must be >= 1")
 
-    # Audio callback writes into this rolling chunk buffer.
-    chunk_buffer = deque()
-    buffered_samples = 0
+    # Audio callback writes into a lock-protected ring buffer.
     max_buffer_samples = window_samples * 4
+    ring_buffer = np.zeros(max_buffer_samples, dtype=np.float32)
+    write_pos = 0
+    buffered_samples = 0
     buffer_lock = threading.Lock()
 
     last_label = None
@@ -355,7 +390,8 @@ def run_live_stream(
         f"Min RMS: {min_rms:.4f} | Min margin: {min_margin:.4f} | "
         f"Smoothing: {max(1, smooth_votes)} | "
         f"Live trim silence: {live_trim_silence} | "
-        f"Input latency: {input_latency}"
+        f"Input latency: {input_latency} | "
+        f"Infer every: {infer_every} tick(s)"
     )
     print("Press Ctrl+C to stop.\n")
 
@@ -369,40 +405,51 @@ def run_live_stream(
         norm_std,
         window_samples,
         apply_trim_silence=False,
+        hidden_activation=hidden_activation,
     )
 
     def audio_callback(indata, frames, time_info, status):
-        nonlocal buffered_samples, overflow_events
+        nonlocal write_pos, buffered_samples, overflow_events
         if status.input_overflow:
             overflow_events += 1
 
         chunk = indata[:, 0].copy()
+        n = len(chunk)
+        if n == 0:
+            return
+
         with buffer_lock:
-            chunk_buffer.append(chunk)
-            buffered_samples += len(chunk)
-            while buffered_samples > max_buffer_samples and chunk_buffer:
-                buffered_samples -= len(chunk_buffer.popleft())
+            if n >= max_buffer_samples:
+                ring_buffer[:] = chunk[-max_buffer_samples:]
+                write_pos = 0
+                buffered_samples = max_buffer_samples
+                return
+
+            end_pos = write_pos + n
+            if end_pos <= max_buffer_samples:
+                ring_buffer[write_pos:end_pos] = chunk
+            else:
+                first = max_buffer_samples - write_pos
+                ring_buffer[write_pos:] = chunk[:first]
+                ring_buffer[:n - first] = chunk[first:]
+
+            write_pos = (write_pos + n) % max_buffer_samples
+            buffered_samples = min(max_buffer_samples, buffered_samples + n)
 
     def get_latest_window():
         with buffer_lock:
             if buffered_samples < window_samples:
                 return None
 
-            need = window_samples
-            parts = []
-            for chunk in reversed(chunk_buffer):
-                if need <= 0:
-                    break
-                if len(chunk) <= need:
-                    parts.append(chunk)
-                    need -= len(chunk)
-                else:
-                    parts.append(chunk[-need:])
-                    need = 0
+            end = write_pos
+            start = (end - window_samples) % max_buffer_samples
+            if start < end:
+                return ring_buffer[start:end].copy()
 
-        if need > 0:
-            return None
-        return np.concatenate(parts[::-1], axis=0).astype(np.float32, copy=False)
+            return np.concatenate(
+                (ring_buffer[start:], ring_buffer[:end]),
+                axis=0,
+            ).astype(np.float32, copy=False)
 
     with sd.InputStream(
         samplerate=sample_rate,
@@ -414,6 +461,7 @@ def run_live_stream(
     ) as stream:
         _ = stream
         next_update = time.monotonic() + hop_seconds
+        tick_index = 0
         while True:
             now = time.monotonic()
             if now < next_update:
@@ -434,6 +482,10 @@ def run_live_stream(
             if latest_window is None:
                 continue
 
+            tick_index += 1
+            if (tick_index % infer_every) != 0:
+                continue
+
             rms = float(np.sqrt(np.mean(latest_window ** 2)))
             if rms < min_rms:
                 if print_all:
@@ -448,6 +500,7 @@ def run_live_stream(
                 norm_std,
                 window_samples,
                 apply_trim_silence=live_trim_silence,
+                hidden_activation=hidden_activation,
             )
 
             if margin < min_margin:
@@ -549,7 +602,32 @@ def main():
             "Use high to reduce overflow risk; low reduces capture latency."
         ),
     )
+    parser.add_argument(
+        "--infer-every",
+        type=int,
+        default=1,
+        help=(
+            "Run model inference every N update ticks (default: 1). "
+            "Use 2 or 3 to reduce CPU load and improve realtime stability."
+        ),
+    )
+    parser.add_argument(
+        "--hidden-activation",
+        type=str,
+        default=DEFAULT_HIDDEN_ACTIVATION,
+        help=(
+            "Hidden-layer activation used by classifier modules whose predict() requires it "
+            f"(default: {DEFAULT_HIDDEN_ACTIVATION})."
+        ),
+    )
     args = parser.parse_args()
+
+    if PREDICT_NEEDS_ACTIVATION and MODULE_ACTIVATIONS and args.hidden_activation not in MODULE_ACTIVATIONS:
+        print(
+            f"ERROR: --hidden-activation must be one of: {', '.join(MODULE_ACTIVATIONS)} "
+            f"(got: {args.hidden_activation})"
+        )
+        sys.exit(1)
 
     try:
         params, threshold, norm_mean, norm_std = get_model(force_retrain=args.retrain)
@@ -560,7 +638,14 @@ def main():
     try:
         if args.once:
             raw_audio = record_clip(args.seconds, default_sample_rate)
-            classify_clip(raw_audio, params, threshold, norm_mean, norm_std)
+            classify_clip(
+                raw_audio,
+                params,
+                threshold,
+                norm_mean,
+                norm_std,
+                hidden_activation=args.hidden_activation,
+            )
             return
 
         run_live_stream(
@@ -576,6 +661,8 @@ def main():
             print_all=args.print_all,
             live_trim_silence=args.live_trim_silence,
             input_latency=args.input_latency,
+            infer_every=args.infer_every,
+            hidden_activation=args.hidden_activation,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
