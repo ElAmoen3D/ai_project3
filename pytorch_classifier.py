@@ -16,6 +16,7 @@ Pipeline:
   5. Train a PyTorch 2-layer neural network (sigmoid hidden activation)
   6. Evaluate: ROC Curve, AUC, Confusion Matrix, Attribute Heatmap
 """
+from __future__ import annotations
 
 import os
 import sys
@@ -35,11 +36,13 @@ try:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
-except ImportError:
+    TORCH_IMPORT_ERROR = None
+except ImportError as exc:
     torch = None
     nn = None
     DataLoader = None
     TensorDataset = None
+    TORCH_IMPORT_ERROR = exc
 
 warnings.filterwarnings("ignore")
 
@@ -241,20 +244,25 @@ def apply_normalizer(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.nda
 # ---------------------------------------------------------
 # STEP 5: PYTORCH 2-LAYER NEURAL NETWORK
 # ---------------------------------------------------------
-class SpeakerMLP(nn.Module):
-    """Input -> Hidden(sigmoid) -> Output(logit)."""
+if nn is not None:
+    class SpeakerMLP(nn.Module):
+        """Input -> Hidden(sigmoid) -> Output(logit)."""
 
-    def __init__(self, input_size: int, hidden_size: int):
-        super().__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.act1 = nn.Sigmoid()
-        self.fc2 = nn.Linear(hidden_size, 1)
+        def __init__(self, input_size: int, hidden_size: int):
+            super().__init__()
+            self.fc1 = nn.Linear(input_size, hidden_size)
+            self.act1 = nn.Sigmoid()
+            self.fc2 = nn.Linear(hidden_size, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = self.act1(x)
-        x = self.fc2(x)
-        return x.squeeze(1)
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.fc1(x)
+            x = self.act1(x)
+            x = self.fc2(x)
+            return x.squeeze(1)
+else:
+    class SpeakerMLP:
+        """Placeholder when PyTorch is not installed."""
+        pass
 
 
 def get_device() -> torch.device:
@@ -278,18 +286,18 @@ def init_model(device: torch.device) -> SpeakerMLP:
     return model
 
 
-@torch.no_grad()
 def predict_proba(model: SpeakerMLP, X: np.ndarray, device: torch.device,
                   batch_size: int = 512) -> np.ndarray:
     """Return probabilities for class 1 (Raiz)."""
     model.eval()
     probs = []
-    for start in range(0, len(X), batch_size):
-        end = min(start + batch_size, len(X))
-        xb = torch.from_numpy(X[start:end]).float().to(device)
-        logits = model(xb)
-        batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
-        probs.append(batch_probs)
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            end = min(start + batch_size, len(X))
+            xb = torch.from_numpy(X[start:end]).float().to(device)
+            logits = model(xb)
+            batch_probs = torch.sigmoid(logits).detach().cpu().numpy()
+            probs.append(batch_probs)
     if not probs:
         return np.array([], dtype=np.float32)
     return np.concatenate(probs, axis=0).astype(np.float32)
@@ -595,7 +603,10 @@ def print_and_save_summary(cm: np.ndarray, auc: float, y_true: np.ndarray,
 def main():
     if torch is None:
         print("ERROR: Missing dependency 'torch'.")
-        print("Install it with: pip install torch")
+        if TORCH_IMPORT_ERROR is not None:
+            print(f"Import error: {TORCH_IMPORT_ERROR}")
+        print("Install it in your venv with:")
+        print("  python -m pip install torch")
         sys.exit(1)
 
     print("=" * 60)

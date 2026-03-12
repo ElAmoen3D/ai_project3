@@ -1,0 +1,20 @@
+VOICE SPEAKER CLASSIFIER — EVALUATION REPORT
+Hidden activation : Leaky ReLU (α=0.01)
+=======================================================
+Architecture  : 16384 -> 64(Leaky ReLU (α=0.01)) -> 1(Sigmoid)
+Epochs        : 100
+Learning rate : 0.01
+Sample rate   : 22050 Hz
+Spectrogram   : 128x128 Mel
+Train samples : 823
+Test samples  : 110
+=======================================================
+Accuracy      : 87.27%
+AUC           : 0.9590
+-------------------------------------------------------
+Class                 Precision     Recall         F1
+Gabriel (0)              0.9362     0.8000     0.8627
+Raiz (1)                 0.8254     0.9455     0.8814
+-------------------------------------------------------
+TP=52  TN=44  FP=11  FN=3
+=======================================================
