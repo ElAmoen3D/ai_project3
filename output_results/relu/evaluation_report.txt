@@ -1,0 +1,20 @@
+VOICE SPEAKER CLASSIFIER — EVALUATION REPORT
+Hidden activation : ReLU
+=======================================================
+Architecture  : 16384 -> 5(ReLU) -> 1(Sigmoid)
+Epochs        : 100
+Learning rate : 0.01
+Sample rate   : 22050 Hz
+Spectrogram   : 128x128 Mel
+Train samples : 823
+Test samples  : 110
+=======================================================
+Accuracy      : 78.18%
+AUC           : 0.9719
+-------------------------------------------------------
+Class                 Precision     Recall         F1
+Gabriel (0)              0.9697     0.5818     0.7273
+Raiz (1)                 0.7013     0.9818     0.8182
+-------------------------------------------------------
+TP=54  TN=32  FP=23  FN=1
+=======================================================
